@@ -9,20 +9,20 @@ from test_daily_review import clock, seed, daily, submit, word
 from test_library_ui import ui
 from src.database.repository import Repository
 from src.models.practice import PracticeMode
-from src.services.daily_review import review_transition, review_status_text
+from src.services.daily_review import review_status_text
+from src.services.fsrs7 import MemoryState, next_state
 from src.services.practice_service import new_long_term_session
 
 
 @pytest.mark.parametrize("stage", range(5))
 @pytest.mark.parametrize("correct", [False, True])
 def test_normal_transition(stage, correct):
-    new_stage, confirmation, interval = review_transition(stage, False, correct)
-    if correct:
-        assert (new_stage, confirmation, interval) == (min(stage+1,4), False, (1,3,7,14,30)[min(stage+1,4)])
-    elif stage >= 2:
-        assert (new_stage, confirmation, interval) == (stage, True, 1)
-    else:
-        assert (new_stage, confirmation, interval) == (0, False, 1)
+    previous = MemoryState(1+stage*5,5,1+stage)
+    state = next_state(previous,3 if correct else 1,1)
+    assert 1 <= state.difficulty <= 10
+    assert state.stability > 0 and state.stability_fast > 0
+    if not correct:
+        assert state.stability <= previous.stability
 
 
 @pytest.mark.parametrize("stage", [2,3,4])
@@ -32,22 +32,22 @@ def test_confirmation_persists_and_uses_actual_result(clock, tmp_path, stage, co
     with repo.connection() as conn:
         conn.execute('UPDATE wrong_words SET review_stage=?', (stage,))
     submit(repo, daily(repo), correct=False)
-    assert word(repo)['review_stage'] == stage
+    assert word(repo)['review_stage'] == 0
     assert word(repo)['review_relearning'] == 1
     for _ in range(3):
         manual = new_long_term_session(repo.get_review_examples([1]))
+        manual.view_state['memory']['phase'] = 'study'
         submit(repo, manual)
     assert word(repo)['review_relearning'] == 1
-    assert word(repo)['review_stage'] == stage
+    assert word(repo)['review_stage'] == 0
     clock[0] += timedelta(days=1)
     repo = Repository(repo.database_path)
     session = daily(repo); session.viewed_answer = True
     stale = deepcopy(session); stale.session_key = 'second-submission'
     submit(repo, session, correct=correct)
-    expected = stage-1 if correct else 0
-    assert word(repo)['review_stage'] == expected
-    assert word(repo)['review_relearning'] == 0
-    assert word(repo)['review_due_date'] == (clock[0]+timedelta(days=(1,3,7,14,30)[expected])).isoformat()
+    assert word(repo)['fsrs_reviews'] == 2
+    assert word(repo)['review_relearning'] == int(not correct)
+    assert word(repo)['review_due_date'] > clock[0].isoformat()
     snapshot = word(repo)
     repo.save_submitted_session(session)
     submit(repo, stale, correct=correct)
@@ -62,9 +62,9 @@ def test_manual_errors_request_but_do_not_consume_confirmation(clock, tmp_path):
     for _ in range(3):
         session = new_long_term_session(repo.get_review_examples([1]))
         submit(repo, session, correct=False)
-    assert word(repo)['review_stage'] == 4 and word(repo)['review_relearning'] == 1
+    assert word(repo)['review_stage'] == 0 and word(repo)['review_relearning'] == 1
     assert word(repo)['review_due_date'] == '2026-09-16'
-    assert word(repo)['review_wrong_count'] == 0
+    assert word(repo)['review_wrong_count'] == 1  # Same timestamp is not three observations.
 
 
 @pytest.mark.parametrize('limit', [20,40,60,80])
@@ -75,8 +75,8 @@ def test_mixed_allocation_and_cap(clock, tmp_path, limit):
         conn.execute("UPDATE wrong_words SET review_due_date='2026-09-01',last_error_at='2026-09-01' WHERE id<=100")
     ids = repo.today_review_ids(start=True)
     assert len(ids) == len(set(ids)) == limit
-    assert sum(i<=100 for i in ids) == limit*7//10
-    assert sum(i>100 for i in ids) == limit-limit*7//10
+    assert sum(i>100 for i in ids) == limit-limit//5
+    assert sum(i<=100 for i in ids) == limit//5
     submit(repo, daily(repo))
     assert repo.today_review_ids() == []
     assert repo.review_status()['completed'] == limit
@@ -93,13 +93,17 @@ def test_no_recent_errors_fills_oldest_and_skips_invalid(clock, tmp_path):
     assert len(repo.list_wrong_words()) == 90
 
 
-def test_recent_pool_excludes_resolved_errors_and_outside_seven_dates(clock, tmp_path):
+def test_due_appointments_not_guessed_from_recent_error_or_legacy_last_date(clock, tmp_path):
     repo = Repository(tmp_path/'db'); seed(repo, 100)
     with repo.connection() as conn:
         conn.execute("UPDATE wrong_words SET review_due_date='2026-09-01',last_error_at='2026-09-01' WHERE id<=80")
         conn.execute("UPDATE wrong_words SET last_error_at='2026-09-08' WHERE id BETWEEN 81 AND 90")
         conn.execute("UPDATE wrong_words SET last_error_at='2026-09-14',review_last_date='2026-09-15' WHERE id>90")
-    assert all(i<=80 for i in repo.today_review_ids())
+    ids = repo.today_review_ids()
+    # Actual due dates/evidence matter, not an old error timestamp or a manually
+    # populated legacy display date. Unused timely capacity fills with old work.
+    assert set(range(81, 101)).issubset(ids)
+    assert sum(i<=80 for i in ids) == 20
 
 
 def test_confirmation_update_rolls_back_on_failed_save(clock, tmp_path):
@@ -116,7 +120,7 @@ def test_confirmation_update_rolls_back_on_failed_save(clock, tmp_path):
     with repo.connection() as conn:
         conn.execute('DROP TRIGGER fail_confirm')
     repo.save_submitted_session(session)
-    assert word(repo)['review_stage']==3 and word(repo)['review_relearning']==0
+    assert word(repo)['review_stage']==1 and word(repo)['review_relearning']==0
 
 
 def test_limit_change_transaction_rollback(clock, tmp_path):
@@ -155,7 +159,7 @@ def test_draft_also_freezes_preview(clock, tmp_path):
     assert len(repo.today_review_ids()) == 40
 
 
-@pytest.mark.parametrize('invalid', [0, 41, '60', None, True])
+@pytest.mark.parametrize('invalid', [0, -1, 10001, '60', None, True])
 def test_invalid_limit_does_not_modify_plan(clock, tmp_path, invalid):
     repo = Repository(tmp_path/'db'); seed(repo)
     ids = repo.today_review_ids()
@@ -165,10 +169,14 @@ def test_invalid_limit_does_not_modify_plan(clock, tmp_path, invalid):
 
 
 def test_settings_ui_before_and_after_start(clock, tmp_path, ui, monkeypatch):
-    from PySide6.QtWidgets import QInputDialog, QMessageBox
+    from PySide6.QtWidgets import QDialog, QMessageBox
+    from src.ui.daily_review_dialog import ReviewQuantityDialog
     messages = []
     monkeypatch.setattr(QMessageBox, 'information', lambda *a: messages.append(a[2]))
-    monkeypatch.setattr(QInputDialog, 'getItem', lambda *a: ('60', True))
+    def choose(dialog, value):
+        dialog.maintenance.setValue(value)
+        return QDialog.Accepted
+    monkeypatch.setattr(ReviewQuantityDialog, 'exec', lambda dialog: choose(dialog, 60))
     repo = Repository(tmp_path/'db'); seed(repo, 100)
     window = ui(repo)
     window.configure_review_limit()
@@ -177,7 +185,7 @@ def test_settings_ui_before_and_after_start(clock, tmp_path, ui, monkeypatch):
     window.start_daily_review()
     first = window.session.target_ids[0]
     window.answer_edits[first].setText('kept input')
-    monkeypatch.setattr(QInputDialog, 'getItem', lambda *a: ('20', True))
+    monkeypatch.setattr(ReviewQuantityDialog, 'exec', lambda dialog: choose(dialog, 20))
     window.configure_review_limit()
     assert '从明天生效' in messages[-1]
     assert window.session.total == 60 and window.answer_edits[first].text() == 'kept input'
@@ -209,7 +217,8 @@ def test_current_upgrade_preserves_old_data_and_freezes_old_plan(clock, tmp_path
     repo = Repository(path)
     assert len(list((tmp_path/'migration_backups').glob('*.db'))) == 1
     clock[0] += timedelta(days=1)
+    repo.configure_review_budgets(80, 20)
     session = daily(repo)
-    assert 0 < session.total <= 80
+    assert 0 < session.total <= 100
     submit(repo, session)
     assert Repository(path).today_review_ids() == []

@@ -1,9 +1,13 @@
 import sqlite3
+import json
+from pathlib import Path
+
+import pytest
 
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from src.database.repository import Repository
-from src.services.quick_write import copy_text, load_quick_write
+from src.services.quick_write import copy_text, load_quick_write, save_quick_write
 from src.services.quick_write_defaults import DEFAULT_STEPS
 from src.ui.quick_write_dialogs import QuickWriteEditor, QuickWritePanel
 from test_library_ui import ui
@@ -17,13 +21,54 @@ def test_default_prompts_and_optional_single_filename(tmp_path):
     second = config["steps"][1]["prompt"]
     assert second.count("{{文件名}}") == 1
     assert "kcyj.docx" not in second
-    assert "happily" not in config["steps"][0]["prompt"]
+    assert "happy≠happily" in config["steps"][0]["prompt"]
     assert "所在句" in config["steps"][0]["prompt"]
     assert "真实可下载" in second
-    assert "故事标题" not in copy_text(second, "故事甲.docx")
+    assert "【本次输出文件名】\n故事甲.docx\n" in copy_text(second, "故事甲.docx")
     assert copy_text(second, "故事甲.docx").count("故事甲.docx") == 1
     assert "未指定" in copy_text(second, "")
     assert DEFAULT_STEPS == config["steps"]
+
+
+def test_new_two_step_prompts_preserve_supplied_document_except_filename_adaptation():
+    source = json.loads((Path(__file__).parent / 'fixtures/quick_write_two_step_source.json').read_text(encoding='utf-8'))
+    paragraphs = source['paragraphs']
+    assert DEFAULT_STEPS[0]['prompt'] == '\n'.join(paragraphs[2:112])
+    second = paragraphs[112:]
+    second[156-112] = '文件名：统一采用本轮顶部【本次输出文件名】。'
+    second[157-112] = '未指定时按英文故事标题命名；已指定时不得改名。扩展名为 .docx，只保留一次。'
+    second[188-112] = '1. 文件名是否符合本轮顶部【本次输出文件名】的要求，标题和正文是否完整。'
+    assert DEFAULT_STEPS[1]['prompt'] == '【本次输出文件名】\n{{文件名}}\n\n' + '\n'.join(second)
+    assert 'djci.docx' not in DEFAULT_STEPS[1]['prompt']
+    assert '无论目标词数量多少，只生成一个英文标题、一篇完整故事' in DEFAULT_STEPS[0]['prompt']
+    assert '同形异义' in DEFAULT_STEPS[0]['prompt']
+    assert 'take 和 take part in' in DEFAULT_STEPS[0]['prompt']
+    assert '重新读取文件并核查' in DEFAULT_STEPS[1]['prompt']
+
+
+@pytest.mark.parametrize('filename,expected', [('故事甲', '故事甲.docx'), ('故事甲.docx', '故事甲.docx'),
+                                             ('故事甲.DOCX', '故事甲.docx'), ('', '未指定；请根据文章标题命名')])
+def test_new_prompts_copy_filename_only_into_second_round(tmp_path, ui, filename, expected):
+    repository = Repository(tmp_path / 'learning.db')
+    panel = QuickWritePanel(repository, ui(repository))
+    panel.filename.setText(filename)
+    panel.copy_step(0)
+    assert QApplication.clipboard().text() == DEFAULT_STEPS[0]['prompt']
+    panel.copy_step(1)
+    copied = QApplication.clipboard().text()
+    assert expected in copied
+    assert '{{文件名}}' not in copied and 'djci.docx' not in copied
+    if filename:
+        assert copied.count(expected) == 1
+    panel.close(); panel.deleteLater()
+
+
+def test_existing_custom_steps_and_filename_are_not_silently_replaced(tmp_path):
+    repository = Repository(tmp_path / 'learning.db')
+    custom = {'filename': '自己的命名', 'steps': [{'name': '我的第一步', 'prompt': '写故事'},
+              {'name': '我的第二步', 'prompt': '生成 {{文件名}}'}, {'name': '我的第三步', 'prompt': '再检查'}]}
+    save_quick_write(repository, custom)
+    assert load_quick_write(repository) == custom
 
 
 def test_copy_panel_saves_filename_and_copies_steps(tmp_path, ui):

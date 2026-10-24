@@ -1,9 +1,12 @@
 from __future__ import annotations
+import json
 
 import logging
+from shiboken6 import isValid
 from html import escape
 import re
 from dataclasses import asdict
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
@@ -12,9 +15,9 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, Q
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
                                QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QSlider,
                                QSplitter, QToolBar, QToolButton, QVBoxLayout, QWidget, QLineEdit,
-                               QInputDialog, QDialog)
+                               QDialog, QInputDialog)
 
-from src.models.practice import PracticeMode
+from src.models.practice import PracticeMode, PracticeSession
 from src.models.article import ArticleSummary
 from src.models.rules import RecognitionRules
 from src.services.library import ArticleLibrary, backup_library
@@ -25,12 +28,17 @@ from src.services.practice_service import (group_items_by_sentence, new_full_ses
 from src.ui.editing_dialogs import RulesDialog, TargetEditorDialog
 from src.ui.import_worker import ImportWorker
 from src.ui.lifecycle import owned_dialog
-from src.ui.dialogs import WrongPracticeHistoryDialog, WrongWordsDialog
+from src.ui.daily_review_dialog import ReviewQuantityDialog
+from src.ui.shortcut_help import ShortcutHelpDialog
+from src.ui.dialogs import WrongPracticeHistoryDialog, WrongWordsDialog, confirm_clear_wrong_words
 from src.ui.unfinished_dialog import UnfinishedPracticeDialog
 from src.ui.quick_write_dialogs import QuickWriteEditor, QuickWritePanel
 from src.ui.widgets.answer_line_edit import AnswerLineEdit
 from src.ui.widgets.article_list import ArticleList
 from src.ui.widgets.flow_layout import FlowLayout
+from src.ui.widgets.toolbar_focus import ToolbarFocus
+from src.ui.widgets.text_menus import TextLabel, TextLineEdit, bind_text_menus
+from src.ui.widgets.reading_selection import ReadingSelection
 from src.ui.typography import is_article_heading, reading_html
 from src.utils.text_utils import natural_sort_key
 
@@ -41,6 +49,7 @@ class MainWindow(QMainWindow):
     def __init__(self, repository, parent=None):
         super().__init__(parent)
         self.repository = repository
+        self.repository.enable_review_continuity()
         self.library = ArticleLibrary(repository)
         self._import_worker = None
         self.pending_library_restore = None
@@ -53,10 +62,19 @@ class MainWindow(QMainWindow):
         self._focus_mode = False
         self._focus_layout = None
         self._preview_session_key = None
+        self._review_home_visible = False
+        self._wrong_reading = False
+        self._wrong_reading_scroll = 0
+        self._result_page_cache = None
+        self._daily_progress_detail = ""
+        self._last_article_path = repository.get_setting("last_article_path", "")
         self._content_generation = 0
+        self._reading_translation = None
         self._last_focused_answer = None
         self._layout_anchor = None
         self._pending_follow = None
+        self._pending_view_restore = None
+        self._view_restore_revision = 0
         self._follow_timer = QTimer(self)
         self._follow_timer.setSingleShot(True)
         self._follow_timer.timeout.connect(self._flush_pending_follow)
@@ -102,8 +120,10 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_body()
         self._build_extra_menu()
+        self._toolbar_focus = ToolbarFocus(self.main_toolbar, self)
         self.main_toolbar.setVisible(bool(repository.get_setting("toolbar_visible", True)))
         self._apply_style()
+        bind_text_menus(self)
         self.statusBar().showMessage("准备就绪：先导入 Word 文章")
         self._update_actions()
         self._refresh_daily_review()
@@ -116,8 +136,13 @@ class MainWindow(QMainWindow):
     def _build_extra_menu(self):
         menu = self.menuBar().addMenu("文章与设置")
         for name, callback in (("本篇识别规则", self.edit_rules), ("默认识别规则", self.edit_default_rules),
-                               ("手动调整挖空", self.edit_targets), ("每日复习数量", self.configure_review_limit)):
+                               ("编辑学习内容", self.edit_targets), ("每日复习数量", self.configure_review_limit)):
             action = menu.addAction(name); action.triggered.connect(callback); self.actions[name] = action
+        menu.addSeparator()
+        self.data_management_menu = menu.addMenu("数据管理")
+        clear = self.data_management_menu.addAction("清空错词本…")
+        clear.triggered.connect(self.clear_wrong_book)
+        self.actions["清空错词本…"] = clear
         practice_menu = self.menuBar().addMenu("练习")
         self.practice_menu = practice_menu
         practice_menu.addAction(self.actions["开始默写"])
@@ -145,6 +170,17 @@ class MainWindow(QMainWindow):
         library_action.triggered.connect(lambda visible: self._set_library_collapsed(not visible))
         self.actions["显示文章列表"] = library_action
 
+        help_menu = self.menuBar().addMenu("帮助")
+        shortcuts = help_menu.addAction("快捷键说明")
+        shortcuts.setShortcut(QKeySequence("F1"))
+        shortcuts.triggered.connect(self.show_shortcut_help)
+        self.addAction(shortcuts)
+        self.actions["快捷键说明"] = shortcuts
+
+    def show_shortcut_help(self):
+        with owned_dialog(ShortcutHelpDialog(self)) as dialog:
+            dialog.exec()
+
     def _build_toolbar(self):
         toolbar = QToolBar("主要操作", self)
         self.main_toolbar = toolbar
@@ -152,6 +188,7 @@ class MainWindow(QMainWindow):
         toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
         toolbar.setObjectName("mainToolbar")
         self.addToolBar(toolbar)
+        leading = QWidget(); leading.setFixedWidth(8); toolbar.addWidget(leading)
         self.actions = {}
 
         def add_action(text, slot, shortcut=None, target=toolbar):
@@ -194,13 +231,20 @@ class MainWindow(QMainWindow):
             ("导出学习备份…", self.backup_data, None),
         ))
         toolbar.addSeparator()
-        add_action("原文", self.show_preview, "Ctrl+1")
+        add_action("原文", lambda: self.show_preview(explicit=True), "Ctrl+1")
         add_action("显示答案", self.show_answers)
         toolbar.addSeparator()
         add_action("历史错词练习", self.show_history, "Ctrl+R")
         add_action("错词本", self.show_wrong_words)
         add_action("今日复习", self.start_daily_review)
         toolbar.widgetForAction(self.actions["今日复习"]).setObjectName("dailyReviewButton")
+        self.daily_review_button = toolbar.widgetForAction(self.actions["今日复习"])
+        self.daily_review_button.setPopupMode(QToolButton.MenuButtonPopup)
+        daily_menu = QMenu(self.daily_review_button)
+        daily_menu.addAction("复习数量设置…", self.configure_review_limit)
+        daily_menu.addAction("今天再加一些…", self.append_daily_review)
+        daily_menu.addAction("小组再练提醒…", self.configure_consolidation)
+        self.daily_review_button.setMenu(daily_menu)
         toolbar.addSeparator()
         add_action("快速成文", self.show_quick_write)
         toolbar.widgetForAction(self.actions["快速成文"]).setObjectName("quickWriteButton")
@@ -236,16 +280,25 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         spacer.setStyleSheet("background:transparent;")
         toolbar.addWidget(spacer)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel(" 显示："))
-        zoom_out = QAction("−", self); zoom_out.triggered.connect(lambda: self.set_zoom(self.zoom_percent - 10))
-        zoom_in = QAction("＋", self); zoom_in.triggered.connect(lambda: self.set_zoom(self.zoom_percent + 10))
-        toolbar.addAction(zoom_out)
+        self.zoom_panel = QFrame()
+        self.zoom_panel.setObjectName("zoomPanel")
+        zoom_layout = QHBoxLayout(self.zoom_panel)
+        zoom_layout.setContentsMargins(10, 0, 10, 0); zoom_layout.setSpacing(0)
+        zoom_layout.addWidget(QLabel("显示："))
+        zoom_out = QToolButton(); zoom_out.setText("−"); zoom_out.setFixedWidth(26)
+        zoom_out.setToolTip("缩小文章（Ctrl+−）")
+        zoom_out.clicked.connect(lambda: self.set_zoom(self.zoom_percent - 10))
+        zoom_layout.addWidget(zoom_out)
         self.zoom_label = QLabel("100%")
         self.zoom_label.setMinimumWidth(48)
         self.zoom_label.setAlignment(Qt.AlignCenter)
-        toolbar.addWidget(self.zoom_label)
-        toolbar.addAction(zoom_in)
+        zoom_layout.addWidget(self.zoom_label, 1)
+        zoom_in = QToolButton(); zoom_in.setText("＋"); zoom_in.setFixedWidth(26)
+        zoom_in.setToolTip("放大文章（Ctrl++）")
+        zoom_in.clicked.connect(lambda: self.set_zoom(self.zoom_percent + 10))
+        zoom_layout.addWidget(zoom_in)
+        self.zoom_panel.setFixedWidth(190)
+        toolbar.addWidget(self.zoom_panel)
         QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self.set_zoom(self.zoom_percent + 10))
         QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.set_zoom(self.zoom_percent - 10))
         QShortcut(QKeySequence("Ctrl+0"), self, activated=lambda: self.set_zoom(100))
@@ -302,7 +355,8 @@ class MainWindow(QMainWindow):
         heading = QLabel("文章列表"); heading.setObjectName("panelTitle"); left_layout.addWidget(heading)
         self.article_summary = QLabel("文章：0 篇\n总重点词：0"); self.article_summary.setObjectName("muted")
         left_layout.addWidget(self.article_summary)
-        self.article_search = QLineEdit()
+        self.article_search = TextLineEdit()
+        self.article_search.setObjectName('articleSearch')
         self.article_search.setPlaceholderText("搜索文章名称…")
         self.article_search.textChanged.connect(self._filter_articles)
         left_layout.addWidget(self.article_search)
@@ -310,6 +364,7 @@ class MainWindow(QMainWindow):
         self.article_list.setObjectName("articleList")
         self.article_list.currentRowChanged.connect(self._schedule_article_selection)
         self.article_list.itemSelectionChanged.connect(self._schedule_article_selection)
+        self.article_list.itemClicked.connect(self._article_list_clicked)
         self.article_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.article_list.customContextMenuRequested.connect(self._article_context_menu)
         left_layout.addWidget(self.article_list, 1)
@@ -323,23 +378,32 @@ class MainWindow(QMainWindow):
         delete_shortcut.triggered.connect(self.remove_selected_article)
         self.article_list.addAction(delete_shortcut)
 
-        center = QWidget(); center_layout = QVBoxLayout(center); center_layout.setContentsMargins(16, 16, 16, 16)
+        center = QWidget(); center_layout = QVBoxLayout(center); center_layout.setContentsMargins(16, 14, 6, 14)
+        center_layout.setSpacing(6)
         self.mode_title = QLabel("欢迎使用英文文章智能默写")
         self.mode_title.setObjectName("contentTitle")
         center_layout.addWidget(self.mode_title)
+        self.mode_detail = QLabel(); self.mode_detail.setObjectName("muted")
+        self.mode_detail.setWordWrap(True); self.mode_detail.hide()
+        center_layout.addWidget(self.mode_detail)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame)
-        self.content = QWidget(); self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(4, 6, 12, 20); self.content_layout.setSpacing(14)
+        self.content, self.content_layout = self._empty_content_page()
         self.scroll.setWidget(self.content); self.scroll.viewport().installEventFilter(self)
+        self.content.installEventFilter(self)
         self.content.setObjectName("articleContent")
+        self.reading_selection = ReadingSelection(self.content, self.scroll, self._cancel_pending_follow)
+        self.reading_selection.translation_handler = self._translate_reading_selection
+        self.reading_selection.translation_allowed = self._can_translate_reading
         self.scroll.verticalScrollBar().valueChanged.connect(self._queue_view_save)
+        self.scroll.verticalScrollBar().rangeChanged.connect(lambda *_: self._schedule_anchor_restore())
         self.scroll.verticalScrollBar().installEventFilter(self)
         self.scroll.verticalScrollBar().sliderPressed.connect(self._cancel_pending_follow)
         center_layout.addWidget(self.scroll, 1)
 
         right = QFrame(); right.setObjectName("statusPanel")
         self.status_panel = right
-        right.setMinimumWidth(200); right.setMaximumWidth(250)
+        right.installEventFilter(self)
+        right.setMinimumWidth(180); right.setMaximumWidth(210)
         right_layout = QVBoxLayout(right); right_layout.setContentsMargins(10, 12, 10, 12)
         right_layout.setSpacing(7)
         label = QLabel("学习状态"); label.setObjectName("panelTitle"); right_layout.addWidget(label)
@@ -347,7 +411,7 @@ class MainWindow(QMainWindow):
         self.progress_text.setWordWrap(True); self.progress_text.setObjectName("statusCard")
         right_layout.addWidget(self.progress_text)
         self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
-        self.progress.setFormat("完成度 %p%")
+        self.progress.setFormat("填写进度 %p%")
         right_layout.addWidget(self.progress)
         self.score_text = QLabel("提交前不会显示正确率")
         self.score_text.setWordWrap(True); self.score_text.setObjectName("scoreCard")
@@ -357,39 +421,59 @@ class MainWindow(QMainWindow):
         self.primary_action_button.setMinimumHeight(42)
         self.primary_action_button.clicked.connect(self._run_primary_action)
         right_layout.addWidget(self.primary_action_button)
-        hint = QLabel("Enter  下一词\nShift+Enter  上一词\nShift+Backspace  清空\nCtrl+滚轮  缩放")
-        hint.setToolTip("Enter：下一词\nShift+Enter：上一词\nShift+Backspace：清空当前输入\nCtrl+滚轮：缩放文章")
+        self.read_wrong_button = QPushButton("阅读本轮错词")
+        self.read_wrong_button.setObjectName("secondaryButton")
+        self.read_wrong_button.clicked.connect(self.read_current_wrong)
+        self.read_wrong_button.setToolTip("在主阅读区查看本轮错词的正确原句；可随时返回当前结果。")
+        right_layout.addWidget(self.read_wrong_button)
+        self.reading_back_button = QPushButton("返回本轮结果")
+        self.reading_back_button.setObjectName("secondaryButton")
+        self.reading_back_button.clicked.connect(self.return_from_wrong_reading)
+        right_layout.addWidget(self.reading_back_button)
+        self.return_result_button = QPushButton("返回原轮结果")
+        self.return_result_button.setObjectName("secondaryButton")
+        self.return_result_button.clicked.connect(self.return_to_consolidation_origin)
+        self.return_result_button.setToolTip("返回加练前的错词和结果；原轮成绩保持原样。")
+        right_layout.addWidget(self.return_result_button)
+        hint = QLabel("Enter  下一词\nShift+Enter  上一词\nShift+Backspace  清空\nCtrl+滚轮  缩放\nF8  切换专注模式")
+        self.shortcut_hint = hint
+        hint.setToolTip("Enter：下一词\nShift+Enter：上一词\nShift+Backspace：清空当前输入\nCtrl+滚轮：缩放文章\nF8：切换专注模式")
         hint.setObjectName("hintCard"); right_layout.addWidget(hint)
         right_layout.addStretch()
 
         self.library_shell = QWidget()
         shell_layout = QVBoxLayout(self.library_shell)
         shell_layout.setContentsMargins(0, 0, 0, 0); shell_layout.setSpacing(0)
-        self.library_toggle = QPushButton("‹ 收起文章列表")
-        self.library_toggle.setFocusPolicy(Qt.NoFocus)
-        self.library_toggle.setStyleSheet("padding:7px 2px;border-radius:0;")
-        self.library_toggle.clicked.connect(lambda: self._set_library_collapsed(not self.library_collapsed))
-        shell_layout.addWidget(self.library_toggle)
         shell_layout.addWidget(left, 1)
         self.library_collapsed = False
         self._expanded_library_width = 260
         splitter.addWidget(self.library_shell); splitter.addWidget(center); splitter.addWidget(right)
-        splitter.setSizes([260, 990, 220])
+        splitter.setSizes([260, 1020, 190])
         splitter.setStretchFactor(1, 1)
+        splitter.splitterMoved.connect(lambda *_: self._sync_zoom_panel())
+        self._sync_zoom_panel()
         if self.repository.get_setting("library_collapsed", False):
             self._set_library_collapsed(True)
 
     def _run_primary_action(self):
         if self.session is not None and self.session.submitted and not self.session.database_id:
             self.retry_save_results()
+        elif self._wrong_reading:
+            self._start_after_wrong_reading()
         elif self.pending_review_session is not None:
             self.start_full_practice()
         elif self.session is not None and not self.session.submitted:
             self.submit()
         elif self.session is not None and self.session.submitted and self.session.wrong_ids:
             self.retry_current_wrong()
+        elif self._review_home_visible:
+            self.start_daily_review()
         elif self._library_article() is not None:
             self.start_full_practice()
+
+    def _sync_zoom_panel(self):
+        if hasattr(self, "status_panel"):
+            self.zoom_panel.setFixedWidth(self.status_panel.width())
 
     def _set_library_collapsed(self, collapsed):
         self._remember_layout_anchor()
@@ -398,11 +482,9 @@ class MainWindow(QMainWindow):
             self._expanded_library_width = max(200, sizes[0])
         self.library_collapsed = collapsed
         self.article_panel.setVisible(not collapsed)
-        self.library_toggle.setText("›\n文\n章" if collapsed else "‹ 收起文章列表")
-        self.library_toggle.setAccessibleName("展开文章列表" if collapsed else "收起文章列表")
-        self.library_shell.setMinimumWidth(34 if collapsed else 200)
-        self.library_shell.setMaximumWidth(34 if collapsed else 16777215)
-        width = 34 if collapsed else self._expanded_library_width
+        self.library_shell.setVisible(not collapsed and not self._focus_mode)
+        self.library_shell.setMinimumWidth(200)
+        width = 0 if collapsed else self._expanded_library_width
         self.splitter.setSizes([width, max(200, sum(sizes) - width - sizes[2]), sizes[2]])
         if "显示文章列表" in self.actions:
             self.actions["显示文章列表"].setChecked(not collapsed)
@@ -428,7 +510,7 @@ class MainWindow(QMainWindow):
             toolbar_visible, collapsed, sizes, expanded_width = self._focus_layout
             self._expanded_library_width = expanded_width
             self._set_library_collapsed(collapsed)
-            self.library_shell.show()
+            self.library_shell.setVisible(not collapsed)
             self.main_toolbar.setVisible(toolbar_visible)
             self.splitter.setSizes(sizes)
             self._focus_layout = None
@@ -438,7 +520,8 @@ class MainWindow(QMainWindow):
         self._schedule_anchor_restore()
 
     def _remember_layout_anchor(self):
-        if self._layout_anchor is not None or not hasattr(self, "scroll"):
+        if (self._layout_anchor is not None or self._pending_view_restore is not None
+                or not hasattr(self, "scroll")):
             return
         bar = self.scroll.verticalScrollBar()
         height = self.scroll.viewport().height()
@@ -448,19 +531,69 @@ class MainWindow(QMainWindow):
             if not 0 <= offset < height:
                 anchor = None
         if anchor is None:
+            widgets = []
             for index in range(self.content_layout.count()):
                 widget = self.content_layout.itemAt(index).widget()
-                if widget and not widget.isHidden() and widget.y() + widget.height() > bar.value():
+                if widget and widget.objectName() == 'originalPage':
+                    widgets.extend(widget.findChildren(QFrame, 'readingParagraph'))
+                elif widget:
+                    widgets.append(widget)
+            for widget in widgets:
+                y = widget.mapTo(self.content, QPoint()).y()
+                if not widget.isHidden() and y + widget.height() > bar.value():
                     anchor = widget
                     break
         offset = anchor.mapTo(self.content, QPoint(0, 0)).y() - bar.value() if anchor else 0
         self._layout_anchor = (self._content_generation, anchor, offset, bar.value())
 
     def _schedule_anchor_restore(self):
-        if self._layout_anchor is not None:
+        # Repeated resize/layout notifications must not keep postponing the
+        # already queued restore. One event-loop turn handles the latest state.
+        if ((self._layout_anchor is not None or self._pending_view_restore is not None)
+                and not self._layout_timer.isActive()):
             self._layout_timer.start(0)
 
+    def _reading_layout_ready(self):
+        # Newly inserted cards may still have their temporary minimum heights.
+        # Neither a saved offset nor focus-follow is meaningful until the flow
+        # height and the scroll range describe the same, fully laid out page.
+        height = self.content_layout.totalHeightForWidth(self.content.width())
+        return (self.content.height() >= height
+                and self.scroll.verticalScrollBar().maximum() + self.scroll.viewport().height()
+                >= self.content.height())
+
     def _restore_layout_anchor(self):
+        pending = self._pending_view_restore
+        if pending is not None:
+            generation, key, desired = pending
+            if (generation != self._content_generation or self.session is None
+                    or key != self.session.session_key):
+                self._pending_view_restore = None
+                return
+            bar = self.scroll.verticalScrollBar()
+            self.layout().activate()
+            self.splitter.widget(1).layout().activate()
+            self.content_layout.activate()
+            # A fresh page can still have the viewport-sized placeholder even
+            # though its height-for-width is already known. Resize once to that
+            # real height; QScrollArea updates its range on the resize event.
+            # This avoids depending on another delayed layout notification.
+            height = max(self.scroll.viewport().height(),
+                         self.content_layout.totalHeightForWidth(self.content.width()))
+            if self.content.height() != height:
+                self.content.resize(self.content.width(), height)
+                self.content_layout.activate()
+            # A rebuilt long page initially has range 0..0. Retain the saved
+            # intent until Qt computes its range instead of losing it at zero.
+            # rangeChanged wakes us; there is no polling or fixed sleep.
+            if not self._reading_layout_ready():
+                return
+            self._pending_view_restore = None
+            self._layout_anchor = None
+            bar.setValue(desired)
+            if self._pending_follow is not None and not self._follow_timer.isActive():
+                self._follow_timer.start(0)
+            return
         state = self._layout_anchor
         if state is None or state[0] != self._content_generation:
             self._layout_anchor = None
@@ -479,58 +612,95 @@ class MainWindow(QMainWindow):
     def _update_reading_margins(self):
         available = self.scroll.viewport().width()
         limit = round(1000 * self.zoom_percent / 100)
-        extra = max(0, available - limit - 16)
-        margins = (4 + extra // 2, 6, 12 + extra - extra // 2, 20)
+        extra = max(0, available - limit - 10)
+        margins = (4 + extra // 2, 6, 6 + extra - extra // 2, 18)
         current = self.content_layout.contentsMargins()
         if margins != (current.left(), current.top(), current.right(), current.bottom()):
             self.content_layout.setContentsMargins(*margins)
 
     def _apply_style(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#f5f7fb; color:#132a45; font-family:'Microsoft YaHei UI'; font-size:15px; }
+            QMainWindow, QWidget { background:#f3f5f7; color:#24364b; font-family:'Microsoft YaHei UI'; font-size:15px; }
             QLabel { background:transparent; }
-            QToolBar#mainToolbar { background:#ffffff; border:none; border-bottom:1px solid #dbe4ef; spacing:2px; padding:7px 10px; }
-            QToolBar#mainToolbar::separator { background:#e1e9f1; width:1px; margin:8px 7px; }
-            QToolButton { background:transparent; border:1px solid transparent; border-radius:7px; padding:7px 9px; color:#234565; }
-            QToolButton:hover { background:#eaf3ff; color:#0d63bd; } QToolButton:pressed { background:#d8eaff; }
-            QToolButton:focus { border-color:#6aa5df; }
-            QToolButton#toolbarMenuButton { font-weight:600; }
-            QToolButton#quickWriteButton { background:#f5f9ff; color:#155f9e; border-color:#e0ecf9; }
-            QToolButton#quickWriteButton:hover { background:#e7f2ff; border-color:#bdd9f3; }
-            QToolButton#dailyReviewButton { background:#edf5ff; color:#075cab; font-weight:600; }
-            QToolButton#dailyReviewButton:hover { background:#dcecff; }
+            QToolBar#mainToolbar { background:#ffffff; border:none; border-bottom:1px solid #e4e8ee; spacing:2px; padding:8px 0; }
+            QFrame#zoomPanel { background:transparent; border-left:1px solid #e4e8ee; }
+            QFrame#zoomPanel QToolButton { padding:7px 3px; }
+            QToolBar#mainToolbar::separator { background:#e6eaf0; width:1px; margin:9px 7px; }
+            QToolButton { background:transparent; border:1px solid transparent; border-radius:7px; padding:7px 9px; color:#405268; }
+            QToolButton:hover { background:#eef2f7; color:#255d98; } QToolButton:pressed { background:#e3ebf5; }
+            QToolButton[keyboardFocus='true']:focus { border-color:#86a8cf; }
+            QToolButton#toolbarMenuButton { font-weight:500; }
+            QToolButton#quickWriteButton { background:#f8fafc; color:#405b79; border-color:#e8edf3; }
+            QToolButton#quickWriteButton:hover { background:#eef3f9; border-color:#d9e3ef; }
+            QToolButton#dailyReviewButton { background:#eaf1fa; color:#245e9d; font-weight:600; }
+            QToolButton#dailyReviewButton:hover { background:#e0ebf7; }
+            QToolButton#dailyReviewButton::menu-button { border:none; background:transparent; width:16px; }
             QToolButton:disabled { color:#a9b5c3; }
-            QFrame#sidePanel { background:#ffffff; border-right:1px solid #e0e7ef; }
-            QFrame#statusPanel { background:#ffffff; border-left:1px solid #e0e7ef; }
-            QLabel#panelTitle, QLabel#contentTitle { font-size:21px; font-weight:700; color:#102f50; }
-            QLabel#contentTitle { padding:3px 3px 10px 3px; }
-            QLabel#muted { color:#71839a; line-height:1.5; }
-            QListWidget#articleList { border:1px solid #d7e2ee; border-radius:11px; background:#fbfdff; outline:none; padding:6px; }
-            QListWidget#articleList::item { padding:8px 11px; margin:2px; border-radius:8px; }
-            QListWidget#articleList::item:hover { background:#eef6ff; }
-            QListWidget#articleList::item:selected { background:#d9ebff; color:#075cab; }
-            QPushButton { border:1px solid #cad8e6; border-radius:8px; padding:8px 14px; background:#ffffff; }
-            QPushButton:hover { border-color:#74ace6; background:#eef6ff; } QPushButton:pressed { background:#dcecff; }
-            QPushButton#primaryButton { background:#1473d1; color:white; border-color:#1473d1; font-weight:600; }
-            QPushButton#primaryButton:hover { background:#0f65ba; }
-            QPushButton:disabled, QPushButton#primaryButton:disabled { background:#f0f3f7; color:#8c9aad; border-color:#dce3ec; }
+            QFrame#sidePanel { background:#f9fafc; border-right:1px solid #e4e8ee; }
+            QFrame#statusPanel { background:#fbfcfd; border-left:1px solid #e4e8ee; }
+            QLabel#panelTitle { font-size:18px; font-weight:600; color:#30445c; }
+            QLabel#contentTitle { font-size:16px; font-weight:600; color:#607187; padding:4px 4px 8px 4px; }
+            QLabel#muted { color:#7b8798; font-size:13px; line-height:1.5; }
+            QListWidget#articleList { border:none; background:transparent; outline:none; padding:0; }
+            QListWidget#articleList::item { padding:10px 12px; margin:2px 0; border-radius:8px; }
+            QListWidget#articleList::item:hover { background:#eef2f7; }
+            QListWidget#articleList::item:selected { background:#e5edf8; color:#285d96; }
+            QPushButton { border:1px solid #dce3eb; border-radius:8px; padding:8px 14px; background:#ffffff; }
+            QPushButton:hover { border-color:#a5bdd8; background:#f4f7fb; } QPushButton:pressed { background:#e6eef8; }
+            QPushButton#primaryButton { background:#2a6db5; color:white; border-color:#2a6db5; font-weight:600; }
+            QPushButton#primaryButton:hover { background:#215f9f; }
+            QPushButton:disabled, QPushButton#primaryButton:disabled, QPushButton#dangerButton:disabled { background:#f0f3f7; color:#8c9aad; border-color:#dce3ec; }
             QPushButton#dangerButton { color:#b42318; border-color:#f0b8b3; background:#fff8f7; }
-            QLabel#statusCard, QLabel#scoreCard { background:#f7faff; border:1px solid #dbe6f2; border-radius:9px; padding:9px; }
+            QLabel#statusCard, QLabel#scoreCard { background:#f1f5f9; border:1px solid #e5eaf0; border-radius:9px; padding:10px; }
             QLabel#hintCard { background:transparent; border:none; color:#71839a; font-size:13px; padding:8px 2px; }
+            QLabel#resultCount { color:#71839a; font-size:13px; background:transparent; }
+            QComboBox, QSpinBox { background:#ffffff; border:1px solid #dce3eb; border-radius:7px; padding:6px 10px; min-height:22px; }
+            QComboBox:hover, QSpinBox:hover { border-color:#a5bdd8; }
+            QComboBox:focus, QSpinBox:focus { border-color:#5f95ce; }
+            QComboBox::drop-down { border:none; width:24px; }
+            QComboBox::down-arrow { image:url("@down-arrow@"); width:12px; height:8px; }
+            QComboBox { padding-right:26px; }
+            QComboBox QAbstractItemView { background:white; border:1px solid #dce3eb; selection-background-color:#e5edf8; selection-color:#245e9d; padding:4px; outline:none; }
+            QCheckBox { spacing:8px; padding:3px 0; }
             QProgressBar { border:1px solid #d4e0ec; border-radius:7px; background:#edf2f7; text-align:center; height:19px; }
             QProgressBar::chunk { background:#3b8ddd; border-radius:6px; }
-            QScrollArea { background:#f5f7fb; } QScrollArea > QWidget > QWidget { background:#f5f7fb; }
+            QScrollArea { background:#f3f5f7; } QScrollArea > QWidget > QWidget { background:#f3f5f7; }
+            QFrame#originalPage { background:#ffffff; border:1px solid #e1e6ec; border-radius:12px; }
+            QFrame#readingParagraph { background:transparent; border:none; }
+            QScrollBar:vertical { background:transparent; width:10px; margin:2px 0; }
+            QScrollBar::handle:vertical { background:#bdcad9; min-height:36px; border-radius:5px; }
+            QScrollBar::handle:vertical:hover { background:#91a8c1; }
+            QScrollBar::handle:vertical:pressed { background:#698bac; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; border:none; background:none; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:none; }
+            QScrollBar:horizontal { background:transparent; height:10px; margin:0 2px; }
+            QScrollBar::handle:horizontal { background:#bdcad9; min-width:36px; border-radius:5px; }
+            QScrollBar::handle:horizontal:hover { background:#91a8c1; }
+            QScrollBar::handle:horizontal:pressed { background:#698bac; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; border:none; background:none; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:none; }
             QLineEdit { border:2px solid #8dbbe7; border-radius:7px; background:white; padding:5px 7px; color:#143a5f; selection-background-color:#78afe3; }
             QLineEdit:focus { border-color:#1674d1; background:#fafdff; }
+            QLineEdit#articleSearch { border:1px solid #dce3eb; border-radius:8px; background:#ffffff; padding:8px 10px; }
+            QLineEdit#articleSearch:focus { border-color:#8eafd3; }
             QLineEdit[answerState='correct'] { border-color:#37a866; background:#f0fbf4; color:#19723c; }
             QLineEdit[answerState='wrong'] { border-color:#db4d4d; background:#fff3f2; color:#b42318; }
             QTableWidget { border:1px solid #d8e2ec; border-radius:8px; gridline-color:#e7edf3; background:white; alternate-background-color:#f7faff; }
             QHeaderView::section { background:#edf4fb; border:none; border-right:1px solid #d8e2ec; padding:9px; font-weight:600; }
             QMenu { background:white; border:1px solid #d4dfeb; border-radius:7px; padding:5px; }
             QMenu::item { padding:8px 28px 8px 12px; border-radius:5px; } QMenu::item:selected { background:#e5f1ff; color:#075cab; }
-        """)
+        """.replace('@down-arrow@', (Path(__file__).resolve().parents[2] / 'assets' / 'chevron-down.svg').as_posix()))
 
     def eventFilter(self, watched, event):
+        if watched is getattr(self, "status_panel", None) and event.type() == QEvent.Resize:
+            self._sync_zoom_panel()
+        if isinstance(watched, AnswerLineEdit) and event.type() in (
+                QEvent.MouseButtonPress, QEvent.KeyPress, QEvent.Wheel):
+            self._cancel_pending_follow()
+        if watched is self.content and event.type() in (QEvent.Resize, QEvent.LayoutRequest):
+            self._schedule_anchor_restore()
+            if self._pending_follow is not None and not self._follow_timer.isActive():
+                self._follow_timer.start(0)
         if watched is self.scroll.viewport() and event.type() == QEvent.Resize:
             self._remember_layout_anchor()
             self._update_reading_margins()
@@ -614,7 +784,9 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
         self.articles.sort(key=lambda a: natural_sort_key(a.filename))
         self._reload_article_list()
-        if self.article_list.currentRow() < 0 and self.articles: self.article_list.setCurrentRow(0)
+        if (self.article_list.currentRow() < 0 and self.articles
+                and self.session is None and self.pending_review_session is None):
+            self.article_list.setCurrentRow(0)
         if self._import_errors: QMessageBox.warning(self, "部分文件未导入", "\n".join(self._import_errors[:8]))
         self.statusBar().showMessage("导入完成，文章和本地副本已保存。", 5000)
         self._update_actions()
@@ -641,7 +813,8 @@ class MainWindow(QMainWindow):
         progress.setValue(len(paths))
         self.articles.sort(key=lambda article: natural_sort_key(article.filename))
         self._reload_article_list()
-        if added and self.article_list.currentRow() < 0:
+        if (added and self.article_list.currentRow() < 0
+                and self.session is None and self.pending_review_session is None):
             self.article_list.setCurrentRow(0)
         if errors:
             preview = "\n".join(errors[:8])
@@ -663,11 +836,21 @@ class MainWindow(QMainWindow):
         self.articles.sort(key=lambda a: natural_sort_key(a.filename))
         self._restoring = True
         self._reload_article_list()
-        if not self._drafts and self.articles and self.article_list.currentRow() < 0:
-            self.article_list.setCurrentRow(0)
+        # Delayed startup/import must not replace a practice or its submitted results.
+        active_practice = self.session is not None or self.pending_review_session is not None or self.current_article is not None
         self._restoring = False
-        if self._drafts: self._activate_session(next(iter(self._drafts.values())))
-        if self.articles:
+        if not active_practice and not self._review_home_visible:
+            if self.articles:
+                selected = next((i for i, a in enumerate(self.articles)
+                                 if a.source_path == self._last_article_path), 0)
+                self.article_list.setCurrentRow(selected)
+                self._pending_article_path = self.articles[selected].source_path
+                self._flush_article_selection()
+            else:
+                self._show_review_home(self.repository.continuity_status())
+            if any(s.submitted and not s.database_id for s in self._drafts.values()):
+                self.statusBar().showMessage('有批改结果尚未保存，请从“练习 → 未完成练习…”打开并重试保存。')
+        if self.articles and not any(s.submitted and not s.database_id for s in self._drafts.values()):
             self.statusBar().clearMessage()
         valid_paths, missing_paths = [], []
         for path in paths:
@@ -681,6 +864,45 @@ class MainWindow(QMainWindow):
             self._start_import(valid_paths)
         if missing_paths:
             self.statusBar().showMessage(f"另有 {len(missing_paths)} 个原文件暂时无法找到，路径已保留，下次启动会重试。", 10000)
+
+    def _show_review_home(self, status):
+        self._cancel_article_switch()
+        self.session = None
+        self.pending_review_session = None
+        self.current_article = None
+        self._clear_content()
+        self._review_home_visible = True
+        self._review_home_status = status
+        self.article_list.blockSignals(True)
+        self.article_list.clearSelection(); self.article_list.setCurrentRow(-1)
+        self.article_list.blockSignals(False)
+        completed = status['completed'] > 0 and status['remaining'] == 0
+        title = '今日复习已完成' if completed else '今日复习'
+        self.mode_title.setText(title)
+        if completed:
+            text = (f"今天计划中的 {status['completed']} 词已提交。\n"
+                    "需要回顾时，可从“历史错词练习”打开本轮记录。")
+        elif status['remaining']:
+            text = f"今天待完成 {status['remaining']} 词。点击右侧“开始今日复习”进入今天的任务。"
+        else:
+            text = "今天暂时没有可开始的复习任务。"
+        detail = QLabel(text); detail.setWordWrap(True)
+        self.content_layout.addWidget(detail)
+        from src.services.review_continuity import plan_summary, future_text
+        plan_note = QLabel(plan_summary(status)+"\n"+future_text(status))
+        plan_note.setWordWrap(True); plan_note.setObjectName('muted')
+        self.content_layout.addWidget(plan_note)
+        note = QLabel('以前的复习草稿已保留，可从“练习 → 未完成练习…”按日期手动打开。')
+        note.setWordWrap(True); note.setObjectName('muted')
+        self.content_layout.addWidget(note); self.content_layout.addStretch()
+        self.progress.setValue(100 if completed else 0)
+        self.progress.setFormat('今日已提交' if completed else '填写进度 %p%')
+        self.progress_text.setText(f"今日已提交：{status['completed']}词\n待完成：{status['remaining']}词")
+        from src.services.review_continuity import status_text
+        self.progress_text.setToolTip(status_text(status))
+        self.score_text.setText('错词仍按计划复习' if completed else '开始后独立作答')
+        self.score_text.setToolTip('提交不代表全部记牢，原成绩和复习安排保持不变。')
+        self._update_actions()
 
     def _reload_article_list(self):
         self._cancel_article_switch()
@@ -763,14 +985,18 @@ class MainWindow(QMainWindow):
             self.article_list.blockSignals(False)
             return False
         self.current_article = article
+        self._last_article_path = article.source_path
         self.session = None
         self._preview_session_key = None
         self.pending_review_session = None
-        pending = next((s for s in self._drafts.values() if s.article.source_path == self.current_article.source_path), None)
-        if pending and not self._restoring:
-            self._activate_session(pending); return True
         self.show_preview()
         return True
+
+    def _article_list_clicked(self, item):
+        if (len(self._selected_article_items()) == 1 and self.current_article is not None
+                and item.data(Qt.UserRole) == self.current_article.source_path
+                and (self.session is not None or self.pending_review_session is not None)):
+            self.show_preview(explicit=True)
 
     def _article_context_menu(self, pos: QPoint):
         index = self.article_list.indexAt(pos)
@@ -790,7 +1016,7 @@ class MainWindow(QMainWindow):
                 self.remove_selected_article()
             else:
                 self._schedule_article_selection()
-                if chosen is preview: self.show_preview()
+                if chosen is preview: self.show_preview(explicit=True)
                 elif chosen is practice: self.start_full_practice()
 
     def remove_selected_article(self):
@@ -830,51 +1056,93 @@ class MainWindow(QMainWindow):
             self.progress_text.setText("尚未导入文章"); self.score_text.setText("提交前不会显示正确率")
         self.statusBar().showMessage(f"已从列表移除 {len(articles)} 篇文章；Word 和学习历史均保留", 5000)
 
-    def show_preview(self):
+    def show_preview(self, explicit=False):
         if not self._flush_article_selection(): return
         if not self.current_article:
             return
+        active = self.session is not None and not self.session.submitted
+        if active:
+            from src.services.learning_evidence import expose
+            expose(self.session)
         if not self._save_active_draft(): return
         if self.session is not None and not self.session.submitted:
             self._preview_session_key = self.session.session_key
         self.session = None
         self.pending_review_session = None
         self.current_article = next((a for a in self.articles if a.source_path == self.current_article.source_path), self.current_article)
+        # Automatic rendering on startup is not proof that the user read a
+        # whole article. Explicit previews and mid-round reveals are observable.
+        if active or explicit:
+            self._record_reading(self.current_article.word_items, "original")
         self.mode_title.setText(f"原文模式　·　{self.current_article.filename}")
         self._clear_content()
+        page = QFrame(); page.setObjectName('originalPage')
+        page_layout = QVBoxLayout(page); page_layout.setContentsMargins(28, 26, 28, 30)
+        page_layout.setSpacing(18)
+        self.content_layout.addWidget(page)
+        first_paragraph = True
         for paragraph in self.current_article.paragraphs:
             if not paragraph.text.strip():
                 continue
-            card = QFrame(); card.setObjectName("paragraphCard")
-            card.setStyleSheet("QFrame#paragraphCard{background:white;border:1px solid #e4eaf1;border-radius:9px;}")
-            layout = QVBoxLayout(card); layout.setContentsMargins(16, 14, 16, 14)
+            card = QFrame(); card.setObjectName('readingParagraph')
+            layout = QVBoxLayout(card); layout.setContentsMargins(0, 0, 0, 0)
             card.setProperty("paragraphText", paragraph.text)
-            label = QLabel()
-            label.setProperty("articleHeading", is_article_heading(paragraph.style_name))
+            label = TextLabel()
+            heading = is_article_heading(paragraph.style_name) or (
+                first_paragraph and len(paragraph.text.strip()) <= 100
+                and not any(s.is_target for s in paragraph.segments)
+                and any(s.style.bold for s in paragraph.segments)
+                and not paragraph.text.rstrip().endswith(('.', '。', '!', '?')))
+            first_paragraph = False
+            label.setProperty("articleHeading", heading)
             label.setWordWrap(True)
             label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             label.setCursor(Qt.IBeamCursor)
             if any(s.is_target for s in paragraph.segments):
-                html = ''.join(('<span style="color:#d61f32;font-weight:700">' + escape(s.text) + '</span>')
+                html = ''.join(('<span style="color:#ba354b;font-weight:700">' + escape(s.text) + '</span>')
                                if s.is_target else escape(s.text) for s in paragraph.segments)
                 label.setTextFormat(Qt.RichText)
                 label.setText(reading_html(html))
             else:
                 label.setTextFormat(Qt.RichText)
                 label.setText(reading_html(escape(paragraph.text)))
+            article = self.current_article
             layout.addWidget(label)
-            self.content_layout.addWidget(card)
+            from src.services.learning_content import note_for
+            for item in article.word_items:
+                if item.paragraph_index == paragraph.index and note_for(item):
+                    note = QLabel(f"{item.answer} · {note_for(item)}"); note.setObjectName('learningNote'); note.setWordWrap(True)
+                    note.setStyleSheet('color:#65778c;font-size:14px;background:transparent;')
+                    layout.addWidget(note)
+            page_layout.addWidget(card)
         self.content_layout.addStretch()
         self.progress_text.setText(f"文章：{self.current_article.filename}\n重点词：{self.current_article.target_count}")
-        self.progress.setValue(0); self.score_text.setText("提交前不会显示正确率")
-        self._apply_zoom_to_content(); self._update_actions()
+        self.progress.setValue(0); self.progress.setFormat("填写进度 %p%")
+        self.progress_text.setToolTip("")
+        self.score_text.setText("提交前不会显示正确率"); self.score_text.setToolTip("")
+        self._apply_zoom_to_content()
+        # A newly built page starts at its own top, before any reading anchor exists.
+        self._cancel_pending_follow(); self.scroll.verticalScrollBar().setValue(0)
+        self._update_actions()
 
     def start_full_practice(self):
+        if self._wrong_reading:
+            self._start_after_wrong_reading()
+            return
         if not self._flush_article_selection(): return
         if self.pending_review_session is not None:
-            session = self.pending_review_session
+            try:
+                session = self.repository.prepare_learning_session(self.pending_review_session)
+            except ValueError as exc:
+                QMessageBox.information(self, '题目已调整', str(exc)); return
             self.pending_review_session = None
+            from src.services.learning_evidence import SCHEMA, utc_now
+            memory = session.view_state.get("memory", {})
+            if memory.get("schema") == SCHEMA:
+                # The preview is expected study before the closed-book round,
+                # not a revelation during that round. Draft resume never resets it.
+                memory["began_at"] = utc_now()
             self._activate_session(session)
             self._save_active_draft()
             return
@@ -893,17 +1161,121 @@ class MainWindow(QMainWindow):
         self.pending_review_session = None
         self._preview_session_key = None
         self.session = new_full_session(article)
+        if self.mode_title.text().startswith("原文模式"):
+            self.session.view_state["memory"]["phase"] = "study"
         self._completion_notified = False
         self._render_practice(full_article=True)
         self._save_active_draft()
 
-    def _render_practice(self, full_article: bool):
+    @contextmanager
+    def _batch_content_layout(self):
+        """Do not relayout the visible page after each individual card change."""
+        updates, layout = self.content.updatesEnabled(), self.content_layout.isEnabled()
+        self.content.setUpdatesEnabled(False)
+        self.content_layout.setEnabled(False)
+        try:
+            yield
+        finally:
+            self.content_layout.setEnabled(layout)
+            self.content.setUpdatesEnabled(updates)
+
+    @staticmethod
+    def _empty_content_page():
+        content = QWidget(); content.setObjectName('articleContent')
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(4, 6, 6, 18); layout.setSpacing(12)
+        return content, layout
+
+    def _result_page_key(self):
+        session = self.session
+        if session is None or not session.submitted:
+            return None
+        return (id(session), session.session_key, id(session.article), tuple(session.target_ids),
+                tuple((r.item_id, r.user_answer, r.correct_answer, r.is_correct) for r in session.results))
+
+    def _discard_result_page(self):
+        cache, self._result_page_cache = self._result_page_cache, None
+        if cache and cache['content'] is not self.content and isValid(cache['content']):
+            cache['content'].hide()
+            cache['content'].setParent(None)
+            cache['content'].deleteLater()
+
+    def _mount_content_page(self, *, retain_old=False):
+        old = self.scroll.takeWidget()
+        if old is not None:
+            old.hide(); old.removeEventFilter(self)
+        self.scroll.setWidget(self.content)
+        self.content.installEventFilter(self)
+        self.reading_selection.set_root(self.content)
+        if old is not None and old is not self.content:
+            # takeWidget() already detaches it. Keep a retained page outside
+            # the live window tree: parenting it back to the window would
+            # repolish thousands of hidden children and slow the reader too.
+            if not retain_old:
+                old.deleteLater()
+
+    @contextmanager
+    def _rebuild_content_page(self, *, retain_result=False):
+        """Replace the old tree once; retain at most the current result page."""
+        self._discard_result_page()
+        cache = None
+        if retain_result:
+            cache = dict(key=self._result_page_key(), content=self.content, layout=self.content_layout,
+                         edits=self.answer_edits, hints=self.answer_hints, paragraphs=self._paragraph_items,
+                         zoom=self.zoom_percent, title=self.mode_title.text(), title_tip=self.mode_title.toolTip(),
+                         detail=self.mode_detail.text(), detail_tip=self.mode_detail.toolTip(),
+                         detail_visible=not self.mode_detail.isHidden(), daily_detail=self._daily_progress_detail)
+        self.content, self.content_layout = self._empty_content_page()
+        self._mount_content_page(retain_old=cache is not None)
+        try:
+            with self._batch_content_layout():
+                yield
+        finally:
+            self._result_page_cache = cache
+
+    def _restore_result_page(self, restore_scroll):
+        cache = self._result_page_cache
+        if (not cache or cache['key'] != self._result_page_key()
+                or not isValid(cache['content'])):
+            self._discard_result_page()
+            return False
+        self._result_page_cache = None
+        self._cancel_article_switch()
+        self._reset_content_state()
+        self.content, self.content_layout = cache['content'], cache['layout']
+        self._mount_content_page()
+        self.answer_edits, self.answer_hints = cache['edits'], cache['hints']
+        self._paragraph_items, self._daily_progress_detail = cache['paragraphs'], cache['daily_detail']
+        self.mode_title.setText(cache['title']); self.mode_title.setToolTip(cache['title_tip'])
+        self.mode_detail.setText(cache['detail']); self.mode_detail.setToolTip(cache['detail_tip'])
+        self.mode_detail.setVisible(cache['detail_visible'])
+        if cache['zoom'] != self.zoom_percent:
+            self._apply_zoom_to_content()
+        else:
+            self.reading_selection.bind()
+        self._show_results(notify=False, refresh_content=False)
+        self._defer_practice_restore(restore_scroll)
+        return True
+
+    def _build_practice_content(self, full_article):
         self._clear_content(); self.answer_edits = {}
         for item in self.session.article.word_items:
             self._paragraph_items.setdefault(item.paragraph_index, []).append(item)
         mode_name = self.session.mode.value
         self.mode_title.setText(self.session.article.filename if self.session.mode == PracticeMode.DAILY_REVIEW
                                else f"{mode_name}　·　{self.session.article.filename}")
+        if self.session.view_state.get('consolidation'):
+            self.mode_title.setText(f"小组再练　·　{self.session.total}词")
+            self.mode_title.setToolTip(self.session.article.filename)
+        else:
+            self.mode_title.setToolTip("")
+        if (self.session.mode == PracticeMode.DAILY_REVIEW
+                and self.session.view_state.get('daily_review_day') != self.repository.today().isoformat()):
+            day = self.session.view_state.get('daily_review_day') or self.session.started_at.date().isoformat()
+            self.mode_title.setText(f"复习草稿 · {day} · {self.session.total}词")
+            self.mode_title.setToolTip('这是以前保存的复习草稿，提交不计入今天的复习任务。')
+        if self.session.mode == PracticeMode.DAILY_REVIEW and not self.session.view_state.get('consolidation'):
+            self._set_daily_review_detail()
         target_set = set(self.session.target_ids)
         if full_article:
             for paragraph in self.session.article.paragraphs:
@@ -915,12 +1287,25 @@ class MainWindow(QMainWindow):
                 self._add_practice_text(first.paragraph_text, first.paragraph_index,
                                         first.sentence_start, first.sentence_end, target_set)
         self.content_layout.addStretch()
+
+    def _render_practice(self, full_article: bool, restore_scroll=None):
+        with self._batch_content_layout():
+            self._build_practice_content(full_article)
         self._update_progress(); self._apply_zoom_to_content(); self._update_actions()
         if self.session.submitted:
             self._show_results(notify=False)
+        self._defer_practice_restore(restore_scroll)
+
+    def _defer_practice_restore(self, restore_scroll=None):
         key = self.session.session_key
         generation = self._content_generation
-        QTimer.singleShot(80, lambda: self._restore_view(key, generation))
+        revision = self._view_restore_revision
+        # Startup may save a draft again before the deferred restore executes.
+        # Preserve the requested offset instead of saving the temporary top.
+        self._pending_view_restore = (generation, key, self.session.view_state.get("scroll", 0))
+        if restore_scroll is not None:
+            self._pending_view_restore = (generation, key, restore_scroll)
+        QTimer.singleShot(0, lambda: self._restore_view(key, generation, revision, restore_scroll))
 
     def _add_practice_text(self, paragraph_text, paragraph_index, start_bound, end_bound, target_set, heading=False):
         if not paragraph_text[start_bound:end_bound].strip():
@@ -942,10 +1327,15 @@ class MainWindow(QMainWindow):
                 edit.textChanged.connect(lambda text, item_id=item.id: self._answer_changed(item_id, text))
                 edit.requestMove.connect(lambda direction, item_id=item.id: self._move_from(item_id, direction))
                 edit.focusEntered.connect(self._answer_focused)
+                edit.installEventFilter(self)
                 flow.addWidget(edit); self.answer_edits[item.id] = edit
-                hint = QLabel(f"正确答案：{item.answer}")
+                hint = TextLabel(f"正确答案：{item.answer}")
                 hint.setObjectName("inlineAnswer")
+                hint.setTextFormat(Qt.PlainText)
+                hint.setProperty("flowText", True)
+                hint.setProperty("flowAnswerHint", True)
                 hint.setWordWrap(True)
+                hint.setIndent(0)  # A styled border must not add QLabel's automatic text indent.
                 hint.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
                 hint.setMinimumWidth(0)
                 hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -960,19 +1350,23 @@ class MainWindow(QMainWindow):
         if heading:
             for label in card.findChildren(QLabel):
                 label.setProperty("articleHeading", True)
+        if items:
+            self._add_learning_notes(flow, items, visible=self.session.submitted)
         self.content_layout.addWidget(card)
 
     def _paragraph_card(self):
         card = QFrame(); card.setObjectName("paragraphCard")
-        card.setStyleSheet("QFrame#paragraphCard{background:white;border:1px solid #e4eaf1;border-radius:9px;}")
-        flow = FlowLayout(card, margin=16, h_spacing=1, v_spacing=12)
+        card.setStyleSheet("QFrame#paragraphCard{background:white;border:1px solid #e2e7ed;border-radius:10px;}")
+        flow = FlowLayout(card, margin=14, h_spacing=1, v_spacing=10)
         return card, flow
 
     @staticmethod
     def _text_label(text):
-        label = QLabel(text if text else " "); label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        label = TextLabel(text if text else " "); label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         label.setTextFormat(Qt.PlainText)
         label.setWordWrap(True)
+        label.setIndent(0)
+        label.setProperty("flowText", True)
         label.setMinimumWidth(0)
         label.setStyleSheet("background:transparent;")
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -980,7 +1374,7 @@ class MainWindow(QMainWindow):
         return label
 
     def _add_text(self, flow, text, target=False):
-        tokens = re.findall(r"\n|[（(【][^\n()（）【】]{1,14}[）)】][.,!?，。！？]*[ \t]*|[A-Za-z0-9]+(?:[-’'][A-Za-z0-9]+)*[.,!?;:]*[ \t]*|[ \t]+|[^\x00-\x7f]{1,5}|.", text)
+        tokens = re.findall(r"\n|[（(【][^\n()（）【】]+[）)】][.,!?，。！？]*[ \t]*|[A-Za-z0-9]+(?:[-’'][A-Za-z0-9]+)*[.,!?;:]*[ \t]*|[ \t]+|[^\x00-\x7f]{1,5}|.", text)
         for token in tokens or [" "]:
             label = self._text_label(token if token != "\n" else "")
             if token == "\n": label.setProperty("flowBreak", True)
@@ -989,10 +1383,23 @@ class MainWindow(QMainWindow):
             if target: label.setStyleSheet("color:#d61f32;font-weight:700;background:transparent;")
             flow.addWidget(label)
 
+    def _add_learning_notes(self, flow, items, visible=True):
+        from src.services.learning_content import note_for
+        for item in items:
+            if not note_for(item): continue
+            label = self._text_label(f"易混备注 · {item.answer}：{note_for(item)}")
+            label.setObjectName('learningNote')
+            label.setStyleSheet('color:#65778c;background:#f3f6fa;border-radius:5px;padding:4px 7px;')
+            label.setProperty('flowWidthLimit', 420)
+            flow.addWidget(label); label.setVisible(visible)
+
     def _answer_changed(self, item_id, text):
         if not self.session or self.session.submitted:
             return
+        if self.reading_selection.selected_text(): self.reading_selection.clear()
         self.session.answers[item_id] = text
+        from src.services.learning_evidence import answer_changed
+        answer_changed(self.session, item_id)
         self._queue_save()
         self._update_progress()
         if self.session.unfilled == 0 and not self._completion_notified:
@@ -1003,6 +1410,7 @@ class MainWindow(QMainWindow):
         ids = list(self.answer_edits)
         if item_id not in ids:
             return
+        self._cancel_pending_follow()
         if direction > 0 and item_id == ids[-1]:
             if not self.session or self.session.submitted:
                 return
@@ -1031,24 +1439,30 @@ class MainWindow(QMainWindow):
         if self.session is None or item_id not in self.answer_edits:
             return
         self._pending_follow = (self._content_generation, self.session.session_key, item_id)
-        self._follow_timer.start(0)
+        if not self._follow_timer.isActive():
+            self._follow_timer.start(0)
 
     def _cancel_pending_follow(self):
         self._pending_follow = None
         self._follow_timer.stop()
         self._layout_anchor = None
         self._layout_timer.stop()
+        self._pending_view_restore = None
+        self._view_restore_revision += 1
 
     def _flush_pending_follow(self):
-        pending, self._pending_follow = self._pending_follow, None
+        pending = self._pending_follow
         if pending is None or pending[0] != self._content_generation or self.session is None:
             return
         if pending[1] != self.session.session_key:
             return
+        self._restore_layout_anchor()
+        if self._pending_view_restore is not None or not self._reading_layout_ready():
+            return
+        self._pending_follow = None
         edit = self.answer_edits.get(pending[2])
         if edit is None or QApplication.focusWidget() is not edit:
             return
-        self._restore_layout_anchor()
         self._center_answer(pending[2])
 
     def _confirm_finished_submission(self):
@@ -1100,9 +1514,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "尚未提交", "当前草稿保存失败，请检查数据目录后重试，答案还在本窗口中。")
             return
         grade_session(self.session)
+        daily_status = None
         try:
             self.repository.save_submitted_session(self.session)
-            self._refresh_daily_review()
+            daily_status = self._refresh_daily_review()
             self._wrong_history_available = None
             self._drafts.pop(self.session.session_key, None)
             self._saved_draft_states.pop(self.session.session_key, None)
@@ -1111,51 +1526,95 @@ class MainWindow(QMainWindow):
             self.session.database_id = None
             self._save_active_draft()
             QMessageBox.warning(self, "保存失败", "批改已完成，成绩待保存。请点击右侧“重试保存成绩”，不会重复累计。")
-        self._show_results()
+        self._show_results(daily_status=daily_status)
 
-    def _show_results(self, notify=True):
+    def _show_results(self, notify=True, daily_status=None, *, refresh_content=True):
+        self.reading_selection.clear()
         self._answers_visible = False
+        if notify and self.session.wrong_ids:
+            self._record_reading([self.session.article.item_map[i] for i in self.session.wrong_ids], "feedback")
         result_map = {result.item_id: result for result in self.session.results}
         self.content.setUpdatesEnabled(False)
         self.content_layout.setEnabled(False)
         try:
-            for item_id, edit in self.answer_edits.items():
-                result = result_map[item_id]
-                edit.setReadOnly(True)
-                edit.setProperty("answerState", "correct" if result.is_correct else "wrong")
-                edit.style().unpolish(edit); edit.style().polish(edit)
-                hint = self.answer_hints.get(item_id)
-                if hint:
-                    hint.hide()
-                    if not result.is_correct:
-                        hint.setText(f"正确答案：{result.correct_answer}")
-                        hint.setStyleSheet("color:#b42318;font-weight:700;background:#fff2f0;border:1px solid #efb5ae;border-radius:6px;padding:5px 8px;")
-                        hint.show()
-            self.score_text.setText(f"重点词：{self.session.total}\n正确：{self.session.correct_count}\n错误：{self.session.wrong_count}\n未填写：{sum(not r.user_answer.strip() for r in self.session.results)}\n正确率：{self.session.accuracy:.1f}%")
+            if refresh_content:
+                for item_id, edit in self.answer_edits.items():
+                    result = result_map[item_id]
+                    edit.setReadOnly(True)
+                    edit.setProperty("answerState", "correct" if result.is_correct else "wrong")
+                    edit.style().unpolish(edit); edit.style().polish(edit)
+                    hint = self.answer_hints.get(item_id)
+                    if hint:
+                        hint.hide()
+                        if not result.is_correct:
+                            hint.setText(f"正确答案：{result.correct_answer}")
+                            hint.setStyleSheet("color:#b42318;font-weight:700;background:#fff2f0;border:1px solid #efb5ae;border-radius:6px;padding:5px 8px;"
+                                              + f"font-size:{round(18 * self.zoom_percent / 100)}px;")
+                            hint.show()
+            from src.services.learning_evidence import result_summary
+            full_summary = result_summary(self.session)
+            summary = full_summary
+            if self.session.view_state.get("memory", {}).get("phase") == "relearning":
+                summary = summary.split("\n", 1)[0]
+            elif summary.startswith('首轮回忆：') and '\n其余' not in summary:
+                # Fully independent answers already have the same numerator and
+                # denominator. Keep the full evidence in the tooltip, not twice
+                # in the narrow sidebar. Mixed evidence retains both figures.
+                summary = summary.split('\n', 1)[0]
+            blanks = sum(not r.user_answer.strip() for r in self.session.results)
+            self.score_text.setText(summary + f"\n剩余错词：{self.session.wrong_count}"
+                                    + (f"\n未填写：{blanks}" if blanks else ''))
+            first = self.session.view_state.get("first_round_result")
+            if first:
+                self.score_text.setText(f"{first.get('label','首轮回忆')}：{first['correct']}/{first['total']}\n" + self.score_text.text())
+            self.score_text.setText('原词回忆结果\n' + self.score_text.text())
+            self.score_text.setToolTip('按题目指定的原词判分；近义表达暂不自动判对。\n' + full_summary)
+            for note in self.content.findChildren(QLabel, 'learningNote'): note.show()
             self.progress.setValue(100)
-            self.progress_text.setText("本轮已提交，答案已锁定。\n正确答案显示在错题旁。")
+            self.progress.setFormat("本轮已提交")
+            self.progress_text.setText("本轮已提交\n可核对错词原句。")
+            self.progress_text.setToolTip("本轮已提交，答案已锁定。完成本轮不代表已经记牢，后续复习仍按原计划安排。")
+            if self.session.view_state.get('consolidation') and not self.session.wrong_count:
+                self.progress_text.setText("本组已全部答对\n可返回原轮结果。")
             if self.session.wrong_count:
-                self._add_wrong_summary()
+                if refresh_content:
+                    self._add_wrong_summary()
+                if self.session.view_state.get("memory", {}).get("phase") == "relearning":
+                    minutes = self.repository.get_setting("consolidation_suggest_minutes", 10)
+                    self.progress_text.setText("本轮纠错已结束\n可阅读错词或加练。")
+                    self.progress_text.setToolTip(f"先读懂剩余错词的原句。有余力可约{minutes}分钟后再练一组，每组最多10词，不必练到全对。")
+                    if self.session.view_state.get('consolidation'):
+                        self.progress_text.setText("本组已结束\n可阅读错词或返回原轮。")
+                        self.progress_text.setToolTip("每词今天最多加练一次。剩余错词会在后续复习中返回，不必今天反复练到全对。")
             if not self.session.database_id:
                 self.progress_text.setText("成绩尚未保存，请点击右侧“重试保存成绩”。")
             elif self.session.mode == PracticeMode.DAILY_REVIEW:
                 if self.session.view_state.get("daily_review_day") != self.session.submitted_at.date().isoformat():
-                    self.progress_text.setText("跨日草稿成绩已保存，本轮不推进长期阶段。\n请从“今日复习”进入今天的任务。")
+                    self.progress_text.setText("跨日草稿成绩已保存，本轮不更新记忆模型。\n请从“今日复习”进入今天的任务。")
                 else:
-                    from src.services.daily_review import review_status_text
-                    self.progress_text.setText(review_status_text(self.repository.review_status(), self.repository.review_limit(today=True)) + "\n成绩已保存，后续复习日期已更新。")
+                    from src.services.review_continuity import status_text
+                    status = daily_status if daily_status is not None else self.repository.continuity_status()
+                    self.progress_text.setText(f"今日已提交：{status['completed']}词\n待完成：{status['remaining']}词")
+                    if status['return_waiting']:
+                        self.progress_text.setText(self.progress_text.text()+f"\n还有{status['return_waiting']}词已到复习时间，分批继续。")
+                    self.progress_text.setToolTip(status_text(status) + "\n提交不等于全部记牢；错词还会按计划返回。")
         finally:
             self.content_layout.setEnabled(True)
-            for flow in self.content.findChildren(FlowLayout): flow.invalidate()
-            self.content_layout.invalidate(); self.content.adjustSize()
+            if refresh_content:
+                for flow in self.content.findChildren(FlowLayout): flow.invalidate()
+                self.content_layout.invalidate(); self.content.adjustSize()
             self.content.setUpdatesEnabled(True)
             self.content.update()
         if not self.session.wrong_count and notify:
             message = "本篇文章全部正确。" if self.session.mode == PracticeMode.FULL_ARTICLE else "本轮错词已经全部正确，本次错词已练习完成。"
             QMessageBox.information(self, "全部正确", message)
+        self.statusBar().showMessage("本轮已提交批改，成绩已保存。" if self.session.database_id
+                                     else "批改已完成，成绩待保存，请重试保存。", 5000)
         self._update_actions()
 
     def _add_wrong_summary(self):
+        if self.content.findChild(QFrame, 'wrongSummary') is not None:
+            return
         panel = QFrame(); panel.setObjectName("wrongSummary")
         panel.setStyleSheet("QFrame#wrongSummary{background:#fff7f6;border:1px solid #f3c8c4;border-radius:9px;padding:10px;} QLabel{background:transparent;border:none;padding:2px;}")
         layout = QVBoxLayout(panel); title = QLabel("本次错词"); title.setStyleSheet("font-weight:700;color:#a92b21;")
@@ -1168,9 +1627,11 @@ class MainWindow(QMainWindow):
             text = f"{result.user_answer or '（空白）'}  ✗  →  {result.correct_answer}"
             if item.chinese: text += f"　（{item.chinese}）"
             lines.append(text)
-        label = QLabel("\n".join(lines)); label.setWordWrap(True); label.setStyleSheet("color:#a92b21;")
+        label = TextLabel("\n".join(lines)); label.setWordWrap(True); label.setStyleSheet("color:#a92b21;")
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse); label.setCursor(Qt.IBeamCursor)
         layout.addWidget(label)
         self.content_layout.insertWidget(max(0, self.content_layout.count() - 1), panel)
+        self.reading_selection.bind()
 
     def show_answers(self):
         if not self.session or self.session.submitted:
@@ -1183,6 +1644,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("答案已显示在输入框旁", 3000)
 
     def _apply_answer_hints(self):
+        self.reading_selection.clear()
+        from src.services.learning_evidence import expose
+        expose(self.session)
+        self._record_reading([self.session.article.item_map[i] for i in self.session.target_ids], "answer")
+        self._queue_save()
         self._remember_layout_anchor()
         self._answers_visible = True
         item_map = self.session.article.item_map
@@ -1190,18 +1656,22 @@ class MainWindow(QMainWindow):
             hint = self.answer_hints.get(item_id)
             if hint:
                 hint.setText(f"答案：{item_map[item_id].answer}")
-                hint.setStyleSheet("color:#075cab;font-weight:700;background:#edf6ff;border:1px solid #9bc8ef;border-radius:6px;padding:5px 8px;")
+                hint.setStyleSheet("color:#075cab;font-weight:700;background:#edf6ff;border:1px solid #9bc8ef;border-radius:6px;padding:5px 8px;"
+                                  + f"font-size:{round(18 * self.zoom_percent / 100)}px;")
                 hint.show()
+        for note in self.content.findChildren(QLabel, 'learningNote'): note.show()
         for flow in self.content.findChildren(FlowLayout): flow.invalidate()
         self.content_layout.invalidate(); self.content.adjustSize()
         self._update_actions()
         self._schedule_anchor_restore()
 
     def _hide_answer_hints(self):
+        self.reading_selection.clear()
         self._remember_layout_anchor()
         self._answers_visible = False
         for hint in self.answer_hints.values():
             hint.hide()
+        for note in self.content.findChildren(QLabel, 'learningNote'): note.hide()
         for flow in self.content.findChildren(FlowLayout): flow.invalidate()
         self.content_layout.invalidate(); self.content.adjustSize()
         self._update_actions()
@@ -1231,7 +1701,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "没有错词", "这条记录不存在，或已经没有可练习的错词。")
             return
         try:
-            next_session = new_saved_wrong_session(record, answers)
+            next_session = self.repository.prepare_learning_session(new_saved_wrong_session(record, answers))
         except ValueError as exc:
             QMessageBox.warning(self, "无法恢复记录", str(exc)); return
         self._show_wrong_preview(next_session)
@@ -1242,7 +1712,119 @@ class MainWindow(QMainWindow):
         if not self.session.database_id:
             self.retry_save_results()
             if not self.session.database_id: return
-        self._show_wrong_preview(new_wrong_session(self.session))
+        if self.session.view_state.get("memory", {}).get("phase") == "relearning":
+            remaining = self.repository.consolidation_remaining(self.session)
+            if not remaining:
+                return
+            maximum = min(10, len(remaining))
+            if maximum == 1:
+                self.start_consolidation(1)
+                return
+            count, ok = QInputDialog.getInt(self, "再练一组", f"还有{len(remaining)}词可加练。\n这一组练几个？", maximum, 1, maximum)
+            if ok:
+                self.start_consolidation(count)
+            return
+        try:
+            self._show_wrong_preview(self.repository.prepare_learning_session(new_wrong_session(self.session)))
+        except ValueError as exc:
+            QMessageBox.information(self, '题目已调整', str(exc))
+
+    def read_current_wrong(self):
+        if not self.session or not self.session.submitted or not self.session.wrong_ids:
+            return
+        if self._wrong_reading:
+            return
+        offset = self.scroll.verticalScrollBar().value()
+        self._record_reading([self.session.article.item_map[i] for i in self.session.wrong_ids], "result-reading")
+        with self._rebuild_content_page(retain_result=True):
+            self._clear_content()
+            self._wrong_reading = True
+            self._wrong_reading_scroll = offset
+            self.mode_title.setText(f"阅读本轮错词　·　{self.session.wrong_count}词")
+            self.progress_text.setText(f"剩余错词：{self.session.wrong_count}\n读完可直接返回\n也可自行开始默写")
+            self.progress_text.setToolTip("仅阅读不创建练习、不修改成绩；可以直接返回本轮结果。")
+            reading = PracticeSession(self.session.article, self.session.mode, self.session.wrong_ids)
+            try:
+                reading = self.repository.prepare_learning_session(reading)
+            except ValueError:
+                self.mode_detail.setText('这些旧题已取消挖空或更换目标词。原成绩保留，可从修正后的文章开始新练习。')
+                self.mode_detail.show()
+                reading = None
+            if reading is not None and reading.article.metadata.get('learning_revision_display'):
+                self.mode_detail.setText('当前阅读修正版；返回结果仍保留当时题目与成绩。'); self.mode_detail.show()
+            if reading is None:
+                self._update_actions(); return
+            targets = set(reading.target_ids)
+            for items in group_items_by_sentence(reading):
+                first = items[0]
+                card, flow = self._paragraph_card()
+                text, start, end = first.paragraph_text, first.sentence_start, first.sentence_end
+                card.setProperty("paragraphText", text[start:end])
+                cursor = start
+                for item in sorted(items, key=lambda item: item.start):
+                    self._add_text(flow, text[cursor:item.start])
+                    before = flow.count()
+                    self._add_text(flow, text[item.start:item.end], target=item.id in targets)
+                    for index in range(before, flow.count()):
+                        flow.itemAt(index).widget().setStyleSheet("color:#075cab;background:#edf5ff;font-weight:700;")
+                    cursor = item.end
+                self._add_text(flow, text[cursor:end])
+                self._add_learning_notes(flow, items)
+                self.content_layout.addWidget(card)
+            self.content_layout.addStretch()
+        self.scroll.verticalScrollBar().setValue(0)
+        self._apply_zoom_to_content(); self._update_actions()
+
+    def return_from_wrong_reading(self):
+        if self._wrong_reading and self.session is not None:
+            offset = self._wrong_reading_scroll
+            if not self._restore_result_page(offset):
+                self._activate_session(self.session, restore_scroll=offset)
+
+    def _start_after_wrong_reading(self):
+        self.retry_current_wrong()
+        if self.pending_review_session is not None:
+            self.start_full_practice()
+
+    def return_to_consolidation_origin(self):
+        if not self.session or not self.session.submitted or not self.session.database_id:
+            return
+        snapshot = self.session.view_state.get("consolidation_origin")
+        if not self.session.view_state.get("consolidation") or not isinstance(snapshot, dict):
+            return
+        try:
+            from src.services.serialization import session_from_dict
+            origin = session_from_dict(snapshot)
+            if not origin.submitted or not origin.database_id or origin.view_state.get("consolidation"):
+                raise ValueError("原轮结果无效")
+            self._activate_session(origin)
+        except Exception:
+            LOGGER.exception("恢复原轮结果失败")
+            QMessageBox.warning(self, "暂时无法返回", "原轮结果暂时无法打开；当前成绩保留，可从练习历史查看。")
+
+    def start_consolidation(self, limit=10):
+        if not self.session or not self._save_active_draft():
+            return
+        try:
+            self.session.view_state["scroll"] = (self._wrong_reading_scroll if self._wrong_reading
+                                                 else self.scroll.verticalScrollBar().value())
+            session = self.repository.create_consolidation(self.session, limit)
+            if session is None:
+                self.statusBar().showMessage("本轮没有可再练的词。剩余错词会在后续复习中返回，无需今天反复刷。", 7000)
+                return
+            self._drafts[session.session_key] = session
+            self._activate_session(session)  # No answer preview; feedback follows submission.
+            self.statusBar().showMessage("小组再练：先遮住英文独立作答，提交后核对。每词今天最多加练一次，不重复占每日名额。", 9000)
+        except Exception:
+            LOGGER.exception("开始小组再练失败")
+            QMessageBox.warning(self, "暂时无法开始", "未能保存小组练习，请稍后重试；原成绩保留。")
+
+    def configure_consolidation(self):
+        value, ok = QInputDialog.getInt(self, "小组再练提醒", "建议隔多少分钟再练？\n只是文字提醒，不强制等待，也不改变记忆算法。",
+                                       int(self.repository.get_setting("consolidation_suggest_minutes", 10)), 0, 120)
+        if ok:
+            self.repository.set_setting("consolidation_suggest_minutes", value)
+            self._update_actions()
 
     def show_wrong_words(self):
         try:
@@ -1253,30 +1835,65 @@ class MainWindow(QMainWindow):
         except Exception:
             LOGGER.exception("读取错词本失败"); QMessageBox.warning(self, "读取失败", "暂时无法读取错词本，请检查数据目录权限。")
 
-    def configure_review_limit(self):
-        from src.services.daily_review import DAILY_LIMIT_OPTIONS
-        try:
-            current = self.repository.review_limit()
-            choice, accepted = QInputDialog.getItem(self, "每日复习数量",
-                "每日上限（到期词不足时按实际数量安排）：\n开始今日复习后，修改从明天生效。",
-                [str(n) for n in DAILY_LIMIT_OPTIONS], DAILY_LIMIT_OPTIONS.index(current), False)
-            if not accepted:
-                return
-            effective_today = self.repository.set_review_limit(int(choice))
+    def clear_wrong_book(self):
+        if confirm_clear_wrong_words(self.repository, self):
             self._refresh_daily_review()
-            suffix = "今天生效" if effective_today else "从明天生效，今天的任务保持不变"
-            QMessageBox.information(self, "每日复习数量", f"每日上限已设为{choice}词；{suffix}。")
+            self.statusBar().showMessage("错词本已清空；学习历史和原 Word 已保留。", 5000)
+
+    def configure_review_limit(self):
+        try:
+            status = self.repository.continuity_status()
+            with owned_dialog(ReviewQuantityDialog(*self.repository.review_capacity(today=True), status, self)) as dialog:
+                if dialog.exec() != QDialog.Accepted:
+                    return
+                result = self.repository.configure_review_capacity(dialog.total.value(), dialog.old.value(),
+                                                                  today_only=dialog.today_only.isChecked())
+                today_only = dialog.today_only.isChecked()
+                scope = "仅今天" if dialog.today_only.isChecked() else "今天及以后"
+            self._refresh_daily_review()
+            total, old = result["budgets"]
+            text = f"设置已保存（{scope}）。\n今天最多{total}词，其中最多重新学{old}个旧词。"
+            if result["started"]:
+                text += f"\n新增{result['added']}个任务，原任务和输入保留。\n已开始任务不因降低上限而减少。"
+                if not today_only:
+                    text += "较小默认值从明天生效。"
+            else:
+                text += "\n今天生效；已按新数量更新未开始的任务。"
+            QMessageBox.information(self, "每日复习数量", text)
         except Exception:
             LOGGER.exception("修改每日复习数量失败")
             QMessageBox.warning(self, "设置失败", "未能更新复习数量，请稍后重试。")
 
+    def append_daily_review(self):
+        try:
+            status = self.repository.continuity_status()
+            if not status["waiting"]:
+                QMessageBox.information(self, "今天再加一些", "目前没有其他已到期的词可添加；已有任务不变。")
+                return
+            with owned_dialog(ReviewQuantityDialog(20, 20 if status["old_waiting"] else 0, status, self, append=True)) as dialog:
+                if dialog.exec() != QDialog.Accepted:
+                    return
+                added = self.repository.append_review_capacity(dialog.total.value(), dialog.old.value())
+            self._refresh_daily_review()
+            self.statusBar().showMessage(f"已追加{added}个今日任务；原任务和输入保留，日常默认数量不变。", 8000)
+        except Exception:
+            LOGGER.exception("追加今日任务失败")
+            QMessageBox.warning(self, "追加失败", "未能追加任务，原任务和输入仍保留。")
+
     def _refresh_daily_review(self):
         try:
-            from src.services.daily_review import review_status_text
+            from src.services.review_continuity import status_text
             count = len(self.repository.today_review_ids())
             self.actions["今日复习"].setText(f"今日复习（{count}）")
-            self.actions["今日复习"].setToolTip(review_status_text(self.repository.review_status(), self.repository.review_limit(today=True))
+            status = self.repository.continuity_status()
+            planned = status['completed'] + status['remaining']
+            self.actions["今日复习"].setToolTip(f"今天安排{planned}词，每日最多{status['total_limit']}词。\n"
+                "先安排当天到期复习，剩余名额再加入旧词；未来数量只作提醒。\n"
+                + status_text(status)
                 + "\n可在“文章与设置 → 每日复习数量”调整上限。")
+            if self._review_home_visible:
+                self._show_review_home(status)
+            return status
         except Exception:
             LOGGER.exception("读取今日复习失败")
             self.actions["今日复习"].setText("今日复习（暂不可用）")
@@ -1290,18 +1907,30 @@ class MainWindow(QMainWindow):
             ids = self.repository.today_review_ids(start=True)
             self._refresh_daily_review()
             if not ids:
-                from src.services.daily_review import review_status_text
-                QMessageBox.information(self, "今日复习", review_status_text(self.repository.review_status(), self.repository.review_limit(today=True)))
+                from src.services.review_continuity import status_text
+                status = self.repository.continuity_status()
+                text = status_text(status)
+                if status["waiting"]:
+                    text += "\n需要继续时，点“今日复习”右侧的小箭头 → 今天再加一些。"
+                QMessageBox.information(self, "今日复习", text)
                 return
             day = self.repository.today().isoformat()
+            pending = self.repository.pending_today_review_answers(day)
             draft = next((s for s in self._drafts.values()
                           if s.mode == PracticeMode.DAILY_REVIEW
-                          and s.view_state.get("daily_review_day") == day), None)
+                          and not s.submitted and s.view_state.get("daily_review_day") == day
+                          and any(s.article.item_map[i].normalized_answer in pending
+                                  for i in s.target_ids)), None)
             if draft is not None:
                 if self._sync_daily_draft(draft):
                     self._activate_session(draft)
                 return
             records = self.repository.get_review_examples(ids)
+            if not records:
+                raise ValueError('今天剩余旧词的题目已取消挖空或更换目标词，暂时没有可用例句。请先检查“编辑学习内容”；原记忆和今日计划保留。')
+            if len(records) < len(ids):
+                QMessageBox.information(self, '部分题目已调整',
+                    f'{len(ids)-len(records)}个旧词暂时没有可用题目，本次先练其余词。\n请检查被取消或更换的挖空；这些词不会被标记为已完成。')
             session = new_daily_session(records, day)
             self._activate_session(session)
             self._save_active_draft()
@@ -1372,29 +2001,47 @@ class MainWindow(QMainWindow):
         filled, total = self.session.filled, self.session.total
         unfilled = total - filled
         percentage = round(filled * 100 / total) if total else 0
+        self.progress.setFormat("本轮已提交" if self.session.submitted else "填写进度 %p%")
         self.progress.setValue(percentage)
         self.progress_text.setText(f"重点词：{total}\n已填写：{filled}\n未填写：{unfilled}")
+        self.progress_text.setToolTip("")
+        if self._daily_progress_detail:
+            self.progress_text.setText(self.progress_text.text() + '\n' + self._daily_progress_detail)
         if not unfilled and not self.session.submitted:
             self.progress_text.setText(self.progress_text.text() + "\n已填完，请检查后手动提交。")
         if not self.session.submitted:
             self.score_text.setText("默写进行中\n提交后统一批改")
+            self.score_text.setToolTip("")
+
+    def _set_daily_review_detail(self):
+        """Display saved selection reasons, without reclassifying or refilling tasks."""
+        day = self.session.view_state.get('daily_review_day')
+        if not day:
+            return
+        targets = {self.session.article.item_map[i].normalized_answer for i in self.session.target_ids}
+        with self.repository.connection() as db:
+            rows = db.execute('''SELECT w.normalized_answer,i.selection_reason FROM daily_review_items i
+                JOIN wrong_words w ON w.id=i.word_id WHERE i.day=?''', (day,)).fetchall()
+        reasons = [r['selection_reason'] for r in rows if r['normalized_answer'] in targets]
+        returning, old = reasons.count('scheduled_return'), reasons.count('old_intake')
+        if returning + old == len(targets):
+            self._daily_progress_detail = f'到期复习：{returning}\n加入旧词：{old}'
+        if day == self.repository.today().isoformat():
+            status = self.repository.continuity_status()
+            total = status['completed'] + status['remaining']
+            self.mode_detail.setText(f"今日安排 {total} 词 · 每日最多 {status['total_limit']} 词")
+            self.mode_detail.setToolTip('旧词上限包含在每日总量内。先安排当天到期复习，剩余名额再加入旧词；未来数量只作提醒。')
+            self.mode_detail.show()
 
     def _render_current(self):
         if self.session:
-            submitted = self.session.submitted
             full = self.session.mode == PracticeMode.FULL_ARTICLE
-            answers = dict(self.session.answers)
-            results = list(self.session.results)
             self._render_practice(full)
-            for item_id, text in answers.items():
-                if item_id in self.answer_edits:
-                    self.answer_edits[item_id].blockSignals(True); self.answer_edits[item_id].setText(text); self.answer_edits[item_id].blockSignals(False)
-            if submitted:
-                self.session.results = results; self.session.submitted = True; self._show_results(notify=False)
         elif self.current_article:
             self.show_preview()
 
     def _apply_zoom_to_content(self):
+        self.reading_selection.end_drag()
         self._remember_layout_anchor()
         self._update_reading_margins()
         updates_enabled = self.content.updatesEnabled()
@@ -1406,16 +2053,22 @@ class MainWindow(QMainWindow):
             for widget in self.content.findChildren(QWidget):
                 if isinstance(widget, (QLabel, AnswerLineEdit)):
                     style = re.sub(r"font-size\s*:[^;]+;?", "", widget.styleSheet())
-                    size = 24 if widget.property("articleHeading") else 20
+                    size = (15 if widget.objectName() == 'learningNote' else 24 if widget.property("articleHeading")
+                            else 18 if widget.property("flowAnswerHint") else 20)
                     updated_style = style + f"font-size:{round(size * self.zoom_percent / 100)}px;"
                     if widget.property("articleHeading") and "font-weight" not in updated_style:
                         updated_style += "font-weight:600;"
                     if widget.styleSheet() != updated_style:
                         widget.setStyleSheet(updated_style)
                 if isinstance(widget, AnswerLineEdit):
+                    widget.setProperty("flowScale", self.zoom_percent / 100)
                     widget.update_preferred_width()
+                elif widget.property("flowAnswerHint"):
+                    widget.setProperty("flowWidthLimit", round(280 * self.zoom_percent / 100))
+                elif widget.objectName() == 'learningNote':
+                    widget.setProperty("flowWidthLimit", round(420 * self.zoom_percent / 100))
             for flow in self.content.findChildren(FlowLayout):
-                flow._v_spacing = round(12 * self.zoom_percent / 100)
+                flow._v_spacing = round(10 * self.zoom_percent / 100)
                 flow.invalidate()
             self.content_layout.invalidate()
             self.content.adjustSize()
@@ -1423,14 +2076,24 @@ class MainWindow(QMainWindow):
             self.content.setUpdatesEnabled(updates_enabled)
         self._schedule_anchor_restore()
 
+        self.reading_selection.bind()
+
+    def _can_translate_reading(self):
+        return (not self._review_home_visible and self.current_article is not None
+                and (self.session is None or self.session.submitted))
+
+    def _translate_reading_selection(self, widget, point):
+        if not self._can_translate_reading() or not self.reading_selection.selected_text():
+            return
+        # No dictionary, worker, popup or networking module is loaded on startup.
+        if self._reading_translation is None:
+            from src.ui.reading_translation import ReadingTranslation
+            self._reading_translation = ReadingTranslation(self, self._can_translate_reading)
+        self._reading_translation.show_selection(self.reading_selection, point)
+
     def _clear_content(self):
-        self._cancel_pending_follow()
-        self._content_generation += 1
-        self._last_focused_answer = None
-        self._answers_visible = False
-        self.answer_edits = {}
-        self.answer_hints = {}
-        self._paragraph_items = {}
+        self._discard_result_page()
+        self._reset_content_state()
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
             if item.widget():
@@ -1439,12 +2102,29 @@ class MainWindow(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
 
+    def _reset_content_state(self):
+        if self._reading_translation is not None:
+            self._reading_translation.dismiss()
+        self.reading_selection.reset()
+        self._review_home_visible = False
+        self._wrong_reading = False
+        self._daily_progress_detail = ""
+        self.mode_detail.clear(); self.mode_detail.hide()
+        self.mode_title.setToolTip("")
+        self._cancel_pending_follow()
+        self._content_generation += 1
+        self._last_focused_answer = None
+        self._answers_visible = False
+        self.answer_edits = {}
+        self.answer_hints = {}
+        self._paragraph_items = {}
+
     def _update_actions(self):
         has_article = self.current_article is not None
         library_article = self._library_article()
         active = self.session is not None and not self.session.submitted
         submitted_wrong = self.session is not None and self.session.submitted and bool(self.session.wrong_ids)
-        self.actions["开始默写"].setEnabled(self.pending_review_session is not None or library_article is not None)
+        self.actions["开始默写"].setEnabled(self.pending_review_session is not None or library_article is not None or self._wrong_reading)
         self.actions["开始默写"].setText("开始默写")
         for name in ("原文", "导出默写纸", "导出答案版"):
             self.actions[name].setEnabled(library_article is not None)
@@ -1469,8 +2149,9 @@ class MainWindow(QMainWindow):
         for name in ("恢复学习备份…", "导出学习备份…"):
             self.actions[name].setEnabled(not importing)
         self.import_button.setEnabled(not importing)
-        for name in ("本篇识别规则", "手动调整挖空"):
+        for name in ("本篇识别规则",):
             if name in self.actions: self.actions[name].setEnabled(in_library and not importing)
+        self.actions['编辑学习内容'].setEnabled(has_article and not importing)
         if self.session is not None and self.session.submitted and not self.session.database_id:
             primary_text, primary_enabled = "重试保存成绩", True
             primary_tip = "重新保存已批改的成绩，不会重复累计"
@@ -1481,11 +2162,22 @@ class MainWindow(QMainWindow):
             primary_text, primary_enabled = "提交批改", True
             primary_tip = "统一批改并锁定本轮答案（Ctrl+Enter）"
         elif submitted_wrong:
-            primary_text, primary_enabled = "只练本轮错词", True
-            primary_tip = "只练习本轮仍然答错的词"
+            if self.session.view_state.get("memory", {}).get("phase") == "relearning":
+                remaining = self.repository.consolidation_remaining(self.session)
+                primary_text, primary_enabled = ("再练一组" if remaining else "本轮已结束"), bool(remaining)
+                minutes = self.repository.get_setting("consolidation_suggest_minutes", 10)
+                primary_tip = f"可休息约{minutes}分钟后再练最多10词；不强制等待，每词每天最多加练一次。"
+            else:
+                primary_text, primary_enabled = "开始错词默写" if self._wrong_reading else "只练本轮错词", True
+                primary_tip = "只练习本轮仍然答错的词"
         elif self.session is not None and self.session.submitted:
             primary_text, primary_enabled = "本轮已全部正确", False
             primary_tip = "本轮已经完成"
+        elif self._review_home_visible:
+            status = self._review_home_status
+            primary_enabled = bool(status['remaining'])
+            primary_text = '开始今日复习' if primary_enabled else '今日已完成' if status['completed'] else '今日暂无任务'
+            primary_tip = '进入今天尚未提交的任务；以前的草稿可从“未完成练习”手动打开。'
         else:
             primary_text = "开始默写"
             primary_enabled = library_article is not None
@@ -1493,6 +2185,15 @@ class MainWindow(QMainWindow):
         self.primary_action_button.setText(primary_text)
         self.primary_action_button.setEnabled(primary_enabled)
         self.primary_action_button.setToolTip(primary_tip)
+        self.read_wrong_button.setVisible(submitted_wrong and not self._wrong_reading)
+        self.reading_back_button.setVisible(self._wrong_reading)
+        self.return_result_button.setVisible(bool(self.session and self.session.submitted
+            and self.session.database_id and self.session.view_state.get("consolidation_origin")) and not self._wrong_reading)
+        preview = self.session is None and self.pending_review_session is None and not self._review_home_visible
+        self.progress.setVisible(not preview and not self._wrong_reading)
+        self.score_text.setVisible(not preview and not self._wrong_reading)
+        self.shortcut_hint.setText(("Enter  下一词\nShift+Enter  上一词\nShift+Backspace  清空\n" if active else "")
+                                  + "Ctrl+滚轮  缩放\nF8  切换专注模式")
 
     def _queue_save(self, *_):
         if self.session and not (self.session.submitted and self.session.database_id): self._autosave.start()
@@ -1508,7 +2209,7 @@ class MainWindow(QMainWindow):
         return (id(session.article), tuple(session.target_ids), tuple(sorted(session.answers.items())),
                 session.mode, session.viewed_answer, session.submitted, session.submitted_at,
                 tuple((r.item_id, r.user_answer, r.correct_answer, r.is_correct) for r in session.results),
-                tuple(sorted(session.view_state.items())))
+                json.dumps(session.view_state, sort_keys=True, ensure_ascii=False))
 
     def _save_active_draft(self):
         if self._closed_for_restore:
@@ -1522,7 +2223,10 @@ class MainWindow(QMainWindow):
             session.view_state["focus"] = focus.item_id
         elif self._last_focused_answer in self.answer_edits:
             session.view_state["focus"] = self._last_focused_answer
-        session.view_state["scroll"] = self.scroll.verticalScrollBar().value()
+        pending = self._pending_view_restore
+        session.view_state["scroll"] = (pending[2] if pending is not None
+            and pending[:2] == (self._content_generation, session.session_key)
+            else self.scroll.verticalScrollBar().value())
         state = self._draft_state(session)
         if self._saved_draft_states.get(session.session_key) == state:
             return True
@@ -1541,22 +2245,26 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("自动保存失败：请勿关闭窗口，检查数据目录权限后重试。")
             return False
 
-    def _restore_view(self, key, generation=None):
-        if self._closed_for_restore:
+    def _restore_view(self, key, generation=None, revision=None, scroll=None):
+        if not isValid(self) or self._closed_for_restore:
             return
         if not self.session or self.session.session_key != key: return
         if generation is not None and generation != self._content_generation: return
+        if revision is not None and revision != self._view_restore_revision: return
         self._layout_timer.stop()
         self._layout_anchor = None
+        self._pending_view_restore = (self._content_generation, key,
+                                      self.session.view_state.get("scroll", 0) if scroll is None else scroll)
         item_id = self.session.view_state.get("focus")
         blank = next((edit for item_id, edit in self.answer_edits.items()
                       if not self.session.answers.get(item_id, "").strip()), None)
         edit = self.answer_edits.get(item_id) or blank or next(iter(self.answer_edits.values()), None)
-        if edit: edit.setFocus()
-        self.scroll.verticalScrollBar().setValue(self.session.view_state.get("scroll", 0))
-        if edit: self._queue_answer_follow(edit.item_id)
+        if scroll is None:
+            if edit: edit.setFocus()
+            if edit: self._queue_answer_follow(edit.item_id)
+        self._restore_layout_anchor()
 
-    def _activate_session(self, session):
+    def _activate_session(self, session, *, restore_scroll=None):
         self._cancel_article_switch()
         self.pending_review_session = None
         self.session = session
@@ -1568,7 +2276,7 @@ class MainWindow(QMainWindow):
         self.article_list.setCurrentRow(match)
         self.article_list.blockSignals(False)
         self._completion_notified = session.unfilled == 0
-        self._render_practice(session.mode == PracticeMode.FULL_ARTICLE)
+        self._render_practice(session.mode == PracticeMode.FULL_ARTICLE, restore_scroll)
 
     def _sync_daily_draft(self, session):
         day = session.view_state.get("daily_review_day")
@@ -1591,13 +2299,13 @@ class MainWindow(QMainWindow):
     def resume_draft(self):
         if not self._save_active_draft(): return
         try:
-            records = self.repository.unfinished_articles()
+            records = self.repository.unfinished_practices()
         except Exception:
             LOGGER.exception("读取未完成练习失败")
             QMessageBox.warning(self, "无法读取", "未完成练习暂时无法读取，原草稿未被删除。")
             return
         if not records:
-            QMessageBox.information(self, "未完成练习", "当前没有未完成的文章默写。")
+            QMessageBox.information(self, "未完成练习", "当前没有未完成的练习草稿。")
             return
         with owned_dialog(UnfinishedPracticeDialog(records, self)) as dialog:
             if dialog.exec() == QDialog.Accepted and dialog.selected_session is not None:
@@ -1655,7 +2363,7 @@ class MainWindow(QMainWindow):
         with owned_dialog(RulesDialog(rules, self)) as dialog:
             if dialog.exec() != QDialog.Accepted: return
             selected_rules = dialog.rules()
-        if article.metadata.get("manually_adjusted"):
+        if article.metadata.get("manually_adjusted") and not article.metadata.get('learning_edited'):
             if QMessageBox.question(self, "重新识别", "重新识别会重置本篇的手动挖空调整，继续吗？",
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
         try:
@@ -1665,17 +2373,89 @@ class MainWindow(QMainWindow):
             LOGGER.exception("重新识别失败"); QMessageBox.warning(self, "识别失败", str(exc))
 
     def edit_targets(self):
-        if not self.current_article or not self._save_active_draft(): return
-        if not self._confirm_edit_answers(): return
-        article = self._library_article()
-        if not article: return
-        with owned_dialog(TargetEditorDialog(article, self)) as dialog:
-            if dialog.exec() == QDialog.Accepted:
+        self._edit_learning_content(self.current_article)
+
+    def _edit_learning_content(self, article=None, item_id=None, paragraph_index=None, item=None):
+        from copy import deepcopy
+        from src.models.article import Article, Paragraph
+        from src.services.learning_content import prepare_article, context_for
+        if article is None: article = self.current_article
+        if item is None and article is not None: item = article.item_map.get(item_id)
+        if item is None and article is not None and not article.source_path:
+            item = next(iter(article.word_items), None)
+        source = item.source_path if item else (article.source_path if article else '')
+        if article is None: return
+        if not self._save_active_draft(): return
+        try:
+            # Always edit the latest learning material, not the submitted result.
+            try:
+                editing = self.repository.apply_learning_content(self.repository.load_article(source))
+            except ValueError:
+                if item is not None:
+                    same = [deepcopy(i) for i in article.word_items if i.source_path == source and i.paragraph_index == item.paragraph_index]
+                    if not same: same = [deepcopy(item)]
+                    editing = Article(source, item.filename, [Paragraph(0, item.paragraph_text, [])], same)
+                    editing.metadata['learning_partial'] = True
+                    for i in same: i.learning_context = context_for(i); i.paragraph_index = 0
+                    editing = self.repository.apply_learning_content(editing)
+                else:
+                    editing = self.repository.apply_learning_content(article)
+            editing = prepare_article(editing)
+            focus_id = item_id
+            if item is not None:
+                key = context_for(item)['key']
+                found = next((i for i in editing.word_items if context_for(i)['key'] == key), None)
+                if found is None:
+                    found = next((i for i in editing.word_items if i.normalized_answer == item.normalized_answer
+                                  and i.learning_context.get('paragraph_index') == context_for(item)['paragraph_index']), None)
+                focus_id = found.id if found else None
+                paragraph_index = found.paragraph_index if found else next((p.index for p in editing.paragraphs
+                    if editing.metadata['learning_paragraphs'][str(p.index)]['paragraph_index'] == context_for(item)['paragraph_index']), None)
+            active = self.session is not None and not self.session.submitted
+            if active and QMessageBox.question(self, '修正学习内容',
+                    '编辑时会显示答案。当前输入保留，修改从下一轮生效；看过答案会如实记录。继续吗？',
+                    QMessageBox.Yes|QMessageBox.No,QMessageBox.No) != QMessageBox.Yes: return
+            visible = {i.normalized_answer for i in editing.word_items}
+            if active:
+                from src.services.learning_evidence import expose
+                ids = [i for i in self.session.target_ids if self.session.article.item_map[i].normalized_answer in visible
+                       or self.session.article.item_map[i].source_path == editing.source_path]
+                if ids: expose(self.session, ids)
+                if not self._save_active_draft(): return
+            shown_items = list(editing.word_items)
+            if self.session:
+                shown_items += [self.session.article.item_map[i] for i in self.session.target_ids
+                                if self.session.article.item_map[i].source_path == editing.source_path]
+            self._record_reading(shown_items, 'content-editor')
+            with owned_dialog(TargetEditorDialog(editing, self, item_id=focus_id, paragraph_index=paragraph_index)) as dialog:
+                if dialog.exec() != QDialog.Accepted: return
+                count = self.repository.save_learning_content(dialog.original_article, dialog.article)
+            if not count: return
+            for n, cached in enumerate(self.articles):
+                if cached.source_path == source:
+                    self.articles[n] = self.library.bind_copy(self.repository.load_article(source))
+            self._reload_article_list()
+            if self.session is None and self.pending_review_session is None:
+                offset = self.scroll.verticalScrollBar().value()
+                self.current_article = next((a for a in self.articles if a.source_path == source), editing)
+                if self.current_article is editing: self.current_article = self.repository.apply_learning_content(editing)
+                self.show_preview(); self.scroll.verticalScrollBar().setValue(offset)
+            elif self._wrong_reading:
+                parent_offset, reader_offset = self._wrong_reading_scroll, self.scroll.verticalScrollBar().value()
+                self._wrong_reading = False; self.read_current_wrong()
+                self._wrong_reading_scroll = parent_offset; self.scroll.verticalScrollBar().setValue(reader_offset)
+            elif self.pending_review_session is not None:
                 try:
-                    self.repository.save_article(dialog.article)
-                    self._replace_article(dialog.article)
-                except Exception:
-                    LOGGER.exception("保存手动调整失败"); QMessageBox.warning(self, "保存失败", "修改未保存，请重试。")
+                    pending = self.repository.prepare_learning_session(self.pending_review_session)
+                    self._show_wrong_preview(pending)
+                except ValueError:
+                    self.pending_review_session = None
+                    self.current_article = self.repository.apply_learning_content(editing)
+                    self.show_preview()
+            self.statusBar().showMessage('修正已保存，后续新练习使用修正版；当前轮次、旧草稿和历史成绩保留。', 9000)
+        except Exception as exc:
+            LOGGER.exception('编辑学习内容失败')
+            QMessageBox.warning(self, '修改未保存', str(exc))
 
     def _confirm_edit_answers(self):
         if not self.session or self.session.submitted: return True
@@ -1693,6 +2473,12 @@ class MainWindow(QMainWindow):
 
     def _show_wrong_preview(self, session):
         """Show complete target answers before beginning a focused wrong-word round."""
+        if session.view_state.get("memory", {}).get("phase") != "relearning":
+            session.view_state.get("memory", {})["phase"] = "study"
+        preview_key = self._record_reading(
+            [session.article.item_map[i] for i in session.target_ids], "correction-preview")
+        if preview_key:
+            session.view_state.get("memory", {})["pre_round_exposure_key"] = preview_key
         self.session = None
         self.pending_review_session = session
         self.current_article = session.article
@@ -1714,13 +2500,28 @@ class MainWindow(QMainWindow):
                 self._add_text(flow, text[item.start:item.end], target=item.id in target_set)
                 cursor = item.end
             if cursor < end_bound: self._add_text(flow, text[cursor:end_bound])
+            self._add_learning_notes(flow, sentence_items)
             card.setProperty("paragraphText", text[start_bound:end_bound])
             self.content_layout.addWidget(card)
         self.content_layout.addStretch()
         self.progress.setValue(0)
+        self.progress.setFormat("填写进度 %p%")
         self.progress_text.setText(f"待复习错词：{session.total}\n先阅读带答案的原句，准备好后点击右侧“开始错词默写”。")
         self.score_text.setText("当前是复习预览\n尚未开始答题，不记录成绩")
+        self.progress_text.setToolTip(""); self.score_text.setToolTip("")
         self._apply_zoom_to_content(); self._update_actions()
+
+    def _record_reading(self, items, reason):
+        from src.services.learning_evidence import utc_now
+        from uuid import uuid4
+        at = utc_now()
+        event_key = reason + ":" + at + ":" + uuid4().hex
+        try:
+            self.repository.record_exposure([item.normalized_answer for item in items], event_key, at)
+            return event_key
+        except Exception:
+            LOGGER.exception("保存阅读记录失败")
+            self.statusBar().showMessage("阅读记录暂未保存；当前轮次仍保留答案查看标记。", 6000)
 
     def backup_data(self):
         if not self._save_active_draft(): return
@@ -1774,6 +2575,8 @@ class MainWindow(QMainWindow):
             toolbar_visible = self._focus_layout[0] if self._focus_mode else not self.main_toolbar.isHidden()
             self.repository.set_setting("library_collapsed", collapsed)
             self.repository.set_setting("toolbar_visible", toolbar_visible)
+            if self._last_article_path:
+                self.repository.set_setting("last_article_path", self._last_article_path)
             return True
         except Exception:
             LOGGER.exception("保存窗口设置失败")
@@ -1799,4 +2602,7 @@ class MainWindow(QMainWindow):
         for timer in (self._daily_timer, self._zoom_timer, self._layout_timer):
             timer.stop()
         self._closed_for_restore = self.pending_library_restore is not None
+        if self._reading_translation is not None:
+            self._reading_translation.dismiss()
+        self._discard_result_page()
         super().closeEvent(event)

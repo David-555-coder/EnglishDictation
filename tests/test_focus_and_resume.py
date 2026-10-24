@@ -55,7 +55,7 @@ def test_focus_mode_restores_layout_and_keeps_menu_and_input(tmp_path, ui, colla
     QApplication.processEvents()
     assert window.library_collapsed == collapsed
     assert window.main_toolbar.isVisible() == toolbar_visible
-    assert window.library_shell.isVisible()
+    assert window.library_shell.isVisible() == (not collapsed)
     assert abs(window.splitter.sizes()[0] - sizes[0]) <= 5
     assert window.session.session_key == key
     assert next(iter(window.answer_edits.values())) is edit
@@ -127,7 +127,7 @@ def test_failed_save_does_not_leave_practice_for_preview(tmp_path, ui, monkeypat
     monkeypatch.undo()
 
 
-def test_width_includes_restored_text_without_relayout_on_each_keystroke(tmp_path, ui, monkeypatch):
+def test_capped_field_keeps_restored_text_without_relayout_on_each_keystroke(tmp_path, ui, monkeypatch):
     window = practice(tmp_path, ui)
     edit = next(iter(window.answer_edits.values()))
     assert edit.placeholderText() == ""
@@ -139,13 +139,16 @@ def test_width_includes_restored_text_without_relayout_on_each_keystroke(tmp_pat
     window.set_zoom(130)
     QApplication.processEvents()
     edit = next(iter(window.answer_edits.values()))
-    assert edit.width() >= edit.fontMetrics().horizontalAdvance(restored) + 24
+    # Long drafts stay intact and scroll inside a compact field; restoring one
+    # must not undo the single-word width cap.
+    assert edit.text() == restored and window.session.answers[edit.item_id] == restored
+    assert round(120 * 1.3) <= edit.width() <= round(170 * 1.3)
     width = edit.property("preferredFlowWidth")
     edit.setText("x" * 600)
     QApplication.processEvents()
     assert edit.property("preferredFlowWidth") == width
     assert edit.text() == "x" * 600 and window.session.answers[edit.item_id] == "x" * 600
-    assert edit.maximumWidth() <= 650
+    assert edit.maximumWidth() == round(170 * 1.3)
 
 
 def test_focus_follow_coalesces_and_manual_scroll_cancels_pending_follow(tmp_path, ui):
@@ -287,6 +290,8 @@ def test_real_delayed_restore_and_restart_survive_reopening(tmp_path, ui, monkey
     reopened = ui(Repository(tmp_path / "learning.db"))
     reopened.show()
     QTest.qWait(240)
+    assert reopened.session is None and reopened.mode_title.text().startswith('原文模式')
+    reopened.resume_draft()
     assert reopened.session.session_key == new_key and reopened.session.filled == 0
     old = next(d for d in reopened.repository.load_drafts() if d.session_key == old_key)
     assert old.answers[item_id] == "saved draft"

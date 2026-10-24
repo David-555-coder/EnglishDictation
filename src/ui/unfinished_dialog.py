@@ -2,6 +2,7 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QListWidget, QListWidgetItem, QVBoxLayout
+from src.models.practice import PracticeMode
 
 
 class UnfinishedPracticeDialog(QDialog):
@@ -13,7 +14,7 @@ class UnfinishedPracticeDialog(QDialog):
         self.setWindowTitle("未完成练习")
         self.resize(610, 430)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("选择一篇文章，继续上次未完成的默写："))
+        layout.addWidget(QLabel("选择草稿，继续未完成的练习："))
         self.list = QListWidget()
         self.list.setWordWrap(True)
         for session, updated_at in records:
@@ -21,12 +22,20 @@ class UnfinishedPracticeDialog(QDialog):
                 timestamp = datetime.fromisoformat(updated_at).strftime("%m-%d %H:%M")
             except ValueError:
                 timestamp = updated_at
-            item = QListWidgetItem(f"{session.article.filename}\n已填写 {session.filled} / {session.total} · 最后练习 {timestamp}")
+            title = session.article.filename
+            if session.mode == PracticeMode.DAILY_REVIEW:
+                day = session.view_state.get('daily_review_day') or session.started_at.date().isoformat()
+                title = f"复习草稿 · {day} · {session.total}词"
+            elif session.mode != PracticeMode.FULL_ARTICLE:
+                title = f"{title} · 错词草稿 {session.started_at:%Y-%m-%d}"
+            if session.submitted and not session.database_id:
+                title = '成绩待保存 · ' + title
+            item = QListWidgetItem(f"{title}\n已填写 {session.filled} / {session.total} · 最后练习 {timestamp}")
             item.setToolTip(session.article.source_path)
             self.list.addItem(item)
         self.list.setStyleSheet("QListWidget::item { padding: 10px 8px; }")
         layout.addWidget(self.list, 1)
-        note = QLabel("保留最近 10 篇未完成练习，超出后自动清理最旧草稿。\n同篇多轮只显示最近一轮；不会删除文章、成绩或错词。")
+        note = QLabel("文章默写显示最近10篇，同篇多轮只显示最近一轮；复习草稿另外按日期列出。\n旧复习草稿不会自动变成今天的任务；继续练习不会删除文章或已有成绩。")
         note.setWordWrap(True)
         note.setStyleSheet("color:#64758a;")
         layout.addWidget(note)

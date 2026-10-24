@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 from src.services.quick_write import (
     FILENAME_TOKEN, copy_text, load_quick_write, normalized_filename, save_quick_write,
 )
+from src.ui.widgets.text_menus import TextLineEdit, PlainTextEdit
 
 
 class QuickWritePanel(QDialog):
@@ -102,7 +103,7 @@ class QuickWritePanel(QDialog):
         filename_row = QHBoxLayout(filename_field)
         filename_row.setContentsMargins(7, 0, 5, 0)
         filename_row.setSpacing(2)
-        self.filename = QLineEdit(self.config["filename"])
+        self.filename = TextLineEdit(self.config["filename"])
         self.filename.setObjectName("filenameInput")
         self.filename.setPlaceholderText("留空则按文章标题命名")
         self.filename.setAccessibleName("输出文件名")
@@ -218,12 +219,12 @@ class QuickWriteEditor(QDialog):
         body.addLayout(left)
         right = QVBoxLayout()
         right.addWidget(QLabel("步骤名称"))
-        self.name_edit = QLineEdit()
+        self.name_edit = TextLineEdit()
         self.name_edit.setPlaceholderText("例如：生成故事并核验")
         self.name_edit.textChanged.connect(self.update_list_name)
         right.addWidget(self.name_edit)
         right.addWidget(QLabel("提示词内容"))
-        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit = PlainTextEdit()
         self.prompt_edit.setPlaceholderText("输入这一轮要复制给 AI 的完整提示词")
         self.prompt_edit.setTabChangesFocus(True)
         right.addWidget(self.prompt_edit, 1)

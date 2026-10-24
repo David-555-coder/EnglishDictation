@@ -79,16 +79,17 @@ def test_catalog_materializes_only_selected_article_and_survives_missing_word(tm
     assert len(calls) == 2
 
 
-def test_startup_draft_does_not_render_first_article_preview(tmp_path, ui, monkeypatch):
+def test_startup_previews_article_and_leaves_draft_unchanged(tmp_path, ui, monkeypatch):
     repo = Repository(tmp_path / "db")
     w = ui(repo); w._import_paths([str(sample_word(tmp_path))]); w.start_full_practice()
     next(iter(w.answer_edits.values())).setText("restored")
     w.close()
     reopened = ui(repo)
-    def fail(): raise AssertionError("unnecessary preview before restoring draft")
-    monkeypatch.setattr(reopened, "show_preview", fail)
+    before = repo.load_drafts()[0].answers.copy()
     reopened._restore_article_library()
-    assert next(iter(reopened.answer_edits.values())).text() == "restored"
+    assert reopened.session is None and not reopened.answer_edits
+    assert reopened.mode_title.text().startswith('原文模式')
+    assert repo.load_drafts()[0].answers == before
 
 
 def test_closed_history_and_wordbook_are_destroyed(tmp_path, ui, monkeypatch):

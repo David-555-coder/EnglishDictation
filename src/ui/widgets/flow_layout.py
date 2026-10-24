@@ -9,6 +9,8 @@ class FlowLayout(QLayout):
         self._h_spacing = h_spacing
         self._v_spacing = v_spacing
         self._height_cache = {}
+        self._geometry_cache = {}
+        self._last_geometry = None
         self.setContentsMargins(margin, margin, margin, margin)
 
     def addItem(self, item):
@@ -40,6 +42,8 @@ class FlowLayout(QLayout):
         # sizes change; explicit invalidation also handles our flow properties.
         if hasattr(self, "_height_cache"):
             self._height_cache.clear()
+            self._geometry_cache.clear()
+            self._last_geometry = None
         super().invalidate()
 
     def expandingDirections(self):
@@ -60,8 +64,11 @@ class FlowLayout(QLayout):
         return height
 
     def setGeometry(self, rect):
+        if self._last_geometry == rect:
+            return
         super().setGeometry(rect)
         self._do_layout(rect, False)
+        self._last_geometry = QRect(rect)
 
     def sizeHint(self):
         return self.minimumSize()
@@ -77,6 +84,14 @@ class FlowLayout(QLayout):
         return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
 
     def _do_layout(self, rect, test_only):
+        key = (rect.width(), self._h_spacing, self._v_spacing, self.getContentsMargins())
+        cached = self._geometry_cache.get(key)
+        if cached is not None:
+            height, placements = cached
+            if not test_only:
+                for item, geometry in placements:
+                    item.setGeometry(geometry.translated(rect.topLeft()))
+            return height
         left, top, right, bottom = self.getContentsMargins()
         effective = rect.adjusted(left, top, -right, -bottom)
         x, y, line_height = effective.x(), effective.y(), 0
@@ -88,26 +103,42 @@ class FlowLayout(QLayout):
                 continue
             hint = QSize(item.sizeHint())
             preferred = widget.property("preferredFlowWidth") if widget else None
+            if widget and widget.property("flowText"):
+                # QLabel's wrapping sizeHint may choose two lines even when the
+                # full annotation fits. Let the flow decide the available width.
+                margins = widget.contentsMargins()
+                preferred = (widget.fontMetrics().horizontalAdvance(widget.text())
+                             + margins.left() + margins.right() + 2 * widget.margin() + 2)
+                limit = widget.property("flowWidthLimit")
+                if limit:
+                    preferred = min(preferred, limit)
             width = min(available, preferred or hint.width())
-            if width < hint.width() and item.hasHeightForWidth():
-                hint.setHeight(max(hint.height(), item.heightForWidth(width)))
+            if widget and widget.property("flowInput"):
+                scale = widget.property("flowScale") or 1.
+                width = min(width, max(round(120 * scale), round(available * .45)))
+            if item.hasHeightForWidth():
+                height = item.heightForWidth(width)
+                if height >= 0:
+                    hint.setHeight(max(widget.minimumHeight() if widget else 0, height))
             hint.setWidth(width)
             measured.append((item, widget, hint))
 
         row = []
+        placements = []
 
         def place_row():
-            if not test_only:
-                for row_item, row_x, row_size in row:
-                    # Center text beside taller input fields instead of top-aligning it.
-                    row_item.setGeometry(QRect(QPoint(row_x, y + (line_height - row_size.height()) // 2), row_size))
+            for row_item, row_x, row_size in row:
+                # Cache relative placements, not absolute parent coordinates.
+                geometry = QRect(QPoint(row_x - rect.x(), y - rect.y()
+                                        + (line_height - row_size.height()) // 2), row_size)
+                placements.append((row_item, geometry))
 
         for index, (item, widget, hint) in enumerate(measured):
             if widget and widget.property("flowBreak"):
                 place_row(); row = []
                 y += max(line_height, hint.height()) + self._v_spacing
                 x, line_height = effective.x(), 0
-                if not test_only: item.setGeometry(QRect(x, y, 0, 0))
+                placements.append((item, QRect(x - rect.x(), y - rect.y(), 0, 0)))
                 continue
             space_x = self._h_spacing
             space_y = self._v_spacing
@@ -132,4 +163,11 @@ class FlowLayout(QLayout):
             x = next_x
             line_height = max(line_height, hint.height())
         place_row()
-        return y + line_height - rect.y() + bottom
+        height = y + line_height - rect.y() + bottom
+        if len(self._geometry_cache) >= 8:
+            self._geometry_cache.pop(next(iter(self._geometry_cache)))
+        self._geometry_cache[key] = height, placements
+        if not test_only:
+            for item, geometry in placements:
+                item.setGeometry(geometry.translated(rect.topLeft()))
+        return height

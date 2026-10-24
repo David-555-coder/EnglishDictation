@@ -37,6 +37,7 @@ class ArticleLibrary:
         article = DocxParser().parse(copy_path, rules=rules or RecognitionRules(), source_path=source)
         article.metadata["copy_name"] = copy_path.name
         article.metadata["source_format"] = suffix
+        article = self.repository.apply_learning_content(article)
         self.repository.save_article(article)
         return article
 
@@ -52,6 +53,7 @@ class ArticleLibrary:
         source = article.metadata.get("document_path") or article.source_path
         updated = DocxParser().parse(source, rules=rules, source_path=article.source_path)
         if "copy_name" in article.metadata: updated.metadata["copy_name"] = article.metadata["copy_name"]
+        updated = self.repository.apply_learning_content(updated)
         self.repository.save_article(updated)
         return updated
 

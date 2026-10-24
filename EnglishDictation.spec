@@ -1,11 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from shutil import copy2
 import PySide6
 
 icon_file = Path(SPECPATH) / 'assets' / 'english_dictation.ico'
 
 a = Analysis(
-    ['app.py'], pathex=[], binaries=[], datas=[(str(icon_file), 'assets')],
+    ['app.py'], pathex=[], binaries=[], datas=[(str(icon_file), 'assets'), ('assets/FSRS-LICENSE.txt', 'assets'),
+                                             ('assets/chevron-down.svg', 'assets')],
     hiddenimports=['pythoncom', 'pywintypes', 'win32com', 'win32com.client'],
     hookspath=[str(Path(SPECPATH) / 'packaging_hooks')], hooksconfig={}, runtime_hooks=[], excludes=[], noarchive=False,
 )
@@ -39,3 +41,10 @@ exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='EnglishDictation',
           disable_windowed_traceback=False, argv_emulation=False,
           target_arch=None, codesign_identity=None, entitlements_file=None,
           icon=str(icon_file))
+
+# Static lexicon stays beside the EXE: never extract 65 MiB at every launch.
+# Explicit public assets only; no learning database, articles or user settings.
+lexicon_output = Path(DISTPATH) / 'assets'
+lexicon_output.mkdir(parents=True, exist_ok=True)
+for name in ('dictionary.sqlite3', 'dictionary_supplements.json', 'ECDICT-LICENSE.txt'):
+    copy2(Path(SPECPATH) / 'assets' / name, lexicon_output / name)

@@ -7,7 +7,7 @@ from docx import Document
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QCoreApplication, QItemSelectionModel, QTimer
 from PySide6.QtGui import QMouseEvent, QTextDocument
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QMenu, QMessageBox
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QMessageBox, QFrame
 
 from src.database.repository import Repository
 from src.services.grading import grade_session
@@ -62,10 +62,10 @@ def test_old_paragraphs_detach_before_deferred_deletion(tmp_path, ui):
 
 def test_preview_preserves_chinese_and_target_format(tmp_path, ui):
     w, _ = library(tmp_path, ui, 1)
-    label = w.content_layout.itemAt(1).widget().findChild(QLabel)
+    label = w.content.findChildren(QFrame, 'readingParagraph')[1].findChild(QLabel)
     document = QTextDocument(); document.setHtml(label.text())
     assert document.toPlainText() == w.current_article.paragraphs[1].text
-    assert '#d61f32' in label.text()
+    assert '<span' in label.text() and 'font-weight:700' in label.text() and 'ambition</span>' in label.text()
     assert label.textInteractionFlags() & Qt.TextSelectableByMouse
 
 

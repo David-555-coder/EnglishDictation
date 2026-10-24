@@ -43,6 +43,7 @@ class WordItem:
     style: RunStyle = field(default_factory=RunStyle)
     user_answer: str = ""
     is_correct: bool | None = None
+    learning_context: dict = field(default_factory=dict)
 
     @property
     def sentence_key(self) -> tuple[int, int, int]:

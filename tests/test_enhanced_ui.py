@@ -12,7 +12,7 @@ from src.models.practice import PracticeMode
 from src.ui.dialogs import WrongPracticeHistoryDialog, WrongWordsDialog
 
 
-def test_close_reopen_restores_input_without_grading_even_if_original_moved(tmp_path, ui):
+def test_close_reopen_restores_input_manually_even_if_original_moved(tmp_path, ui, monkeypatch):
     path = sample_word(tmp_path)
     repo = Repository(tmp_path / "data" / "db")
     first = ui(repo); first._import_paths([str(path)]); first.start_full_practice()
@@ -22,6 +22,11 @@ def test_close_reopen_restores_input_without_grading_even_if_original_moved(tmp_
     assert not first.session.submitted and not first.session.results
     first.close(); path.unlink()
     reopened = ui(Repository(repo.database_path)); reopened._restore_article_library()
+    assert reopened.session is None and not reopened.answer_edits
+    from src.ui.unfinished_dialog import UnfinishedPracticeDialog
+    from PySide6.QtWidgets import QDialog
+    monkeypatch.setattr(UnfinishedPracticeDialog, 'exec', lambda dialog: QDialog.Accepted)
+    reopened.resume_draft()
     assert reopened.answer_edits[item_id].text() == "Ambition"
     assert not reopened.session.submitted
     assert reopened.repository.list_history() == []
@@ -38,7 +43,7 @@ def test_autosave_is_silent_but_still_persists(tmp_path, ui):
     assert repo.load_drafts()[0].answers[item_id] == "unfinished"
 
 
-def test_switching_articles_preserves_inputs_and_zoom_does_not_rebuild(tmp_path, ui):
+def test_switching_articles_preserves_inputs_and_zoom_does_not_rebuild(tmp_path, ui, monkeypatch):
     a = sample_word(tmp_path)
     second_dir = tmp_path / 'second'; second_dir.mkdir()
     b = sample_word(second_dir)
@@ -51,6 +56,11 @@ def test_switching_articles_preserves_inputs_and_zoom_does_not_rebuild(tmp_path,
     assert edit.text() == "ambitio"
     window.article_list.setCurrentRow(1)
     window.article_list.setCurrentRow(0)
+    assert window.session is None and not window.answer_edits
+    from src.ui.unfinished_dialog import UnfinishedPracticeDialog
+    from PySide6.QtWidgets import QDialog
+    monkeypatch.setattr(UnfinishedPracticeDialog, 'exec', lambda dialog: QDialog.Accepted)
+    window.resume_draft()
     assert window.answer_edits[first_id].text() == "ambitio"
 
 
@@ -77,8 +87,9 @@ def test_actual_submit_history_restore_retry_and_all_correct(tmp_path, ui, monke
     window.answer_edits[first.id].setText(first.answer); window.submit()
     assert window.session.wrong_count == 1
     window.retry_current_wrong()
-    assert window.session is None and window.pending_review_session.total == 1
-    window.start_full_practice()
+    assert window.pending_review_session is None and window.session.total == 1
+    assert window.session.view_state['consolidation']
+    assert not window._answers_visible  # Extra group begins closed-book, not another preview.
     assert len(window.answer_edits) == 1
     last_id = window.session.target_ids[0]
     window.answer_edits[last_id].setText(window.session.article.item_map[last_id].answer)
@@ -97,6 +108,11 @@ def test_failed_result_save_is_recoverable_after_reopen(tmp_path, ui, monkeypatc
     assert window.session.submitted and window.session.database_id is None
     window.close()
     reopened = ui(Repository(repo.database_path)); reopened._restore_article_library()
+    assert reopened.session is None
+    from src.ui.unfinished_dialog import UnfinishedPracticeDialog
+    from PySide6.QtWidgets import QDialog
+    monkeypatch.setattr(UnfinishedPracticeDialog, 'exec', lambda dialog: QDialog.Accepted)
+    reopened.resume_draft()
     assert reopened.session.submitted
     assert all(edit.isReadOnly() for edit in reopened.answer_edits.values())
     reopened.retry_save_results(); reopened.retry_save_results()

@@ -132,7 +132,8 @@ def test_owner_old_backup_is_compatible_without_changing_learning_records(tmp_pa
     reopened = Repository(current.database_path)
     with reopened.connection() as connection:
         for table in tables:
-            assert [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")] == original[table]
+            width = len(original[table][0]) if original[table] else 0
+            assert [tuple(row)[:width] for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")] == original[table]
 
 
 @pytest.mark.parametrize("mutation", ["bad_db", "missing_db", "missing_copy", "bad_copy", "future", "bad_draft", "schema", "foreign_keys"])

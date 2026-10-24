@@ -1,7 +1,7 @@
 import sqlite3
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QToolButton
 from test_library_ui import ui, sample_word
 from test_daily_review import seed
 from src.database.repository import Repository
@@ -17,8 +17,7 @@ def test_zoom_and_daily_review_stay_visible_at_minimum_width(tmp_path, ui):
         window.show()
         QApplication.processEvents()
         toolbar = window.main_toolbar
-        zoom_buttons = [toolbar.widgetForAction(action) for action in toolbar.actions()
-                        if action.text() in ('−', '＋')]
+        zoom_buttons = window.zoom_panel.findChildren(QToolButton)
         assert len(zoom_buttons) == 2
         assert window.zoom_label.isVisible()
         assert all(button.isVisible() for button in zoom_buttons)
@@ -53,11 +52,13 @@ def test_compact_toolbar_keeps_secondary_actions_accessible(tmp_path, ui, monkey
                for name in ('历史错词练习', '错词本', '快速成文'))
 
 
-def test_shortcut_hint_shows_all_four_shortcuts(tmp_path, ui):
+def test_shortcut_hint_shows_all_five_shortcuts(tmp_path, ui):
     window = ui(Repository(tmp_path / 'db'))
     hint = window.status_panel.findChild(QLabel, 'hintCard')
-    assert hint.text().count('\n') == 3
-    for shortcut in ('Enter', 'Shift+Enter', 'Shift+Backspace', 'Ctrl+滚轮'):
+    assert 'F8' in hint.text() and 'Enter' not in hint.text()
+    window._import_paths([str(sample_word(tmp_path))]); window.start_full_practice()
+    assert hint.text().count('\n') == 4
+    for shortcut in ('Enter', 'Shift+Enter', 'Shift+Backspace', 'Ctrl+滚轮', 'F8'):
         assert shortcut in hint.text()
 
 
@@ -72,7 +73,7 @@ def test_toolbar_groups_and_practice_menu_remain_available_when_toolbar_hidden(t
     assert w.actions['导入文章'].shortcut().toString() == 'Ctrl+O'
     assert w.export_button.isEnabled() and not w.actions['导出默写纸'].isEnabled()
     assert actions.index(next(a for a in actions if w.main_toolbar.widgetForAction(a) is w.export_button)) == actions.index(next(a for a in actions if w.main_toolbar.widgetForAction(a) is w.import_button)) + 1
-    assert labels.index('快速成文') < actions.index(next(a for a in actions if w.main_toolbar.widgetForAction(a) is w.zoom_label))
+    assert labels.index('快速成文') < actions.index(next(a for a in actions if w.main_toolbar.widgetForAction(a) is w.zoom_panel))
     assert [a.text() for a in w.practice_menu.actions() if not a.isSeparator()] == ['开始默写','提交批改','未完成练习…']
 
 

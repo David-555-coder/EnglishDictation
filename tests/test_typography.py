@@ -47,7 +47,8 @@ def test_display_skips_blank_cards_but_preserves_article_and_answers(tmp_path, u
     w = ui(repo)
     w._import_paths([str(uneven_article(tmp_path))])
     snapshot = deepcopy(w.current_article)
-    cards = [c for c in w.content.findChildren(QFrame) if c.objectName() == 'paragraphCard']
+    assert len(w.content.findChildren(QFrame, 'originalPage')) == 1
+    cards = w.content.findChildren(QFrame, 'readingParagraph')
     assert len(cards) == 3
     assert all(c.property('paragraphText').strip() for c in cards)
     assert 'line-height:150%' in cards[1].findChild(QLabel).text()

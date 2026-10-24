@@ -21,12 +21,14 @@ def clock(monkeypatch):
 
 
 def seed(repo, count=1, due="2026-09-15"):
+    # Synthetic due tasks are explicitly enrolled in maintenance. Legacy/backlog
+    # migration and independent quotas have dedicated regression fixtures.
     with repo.connection() as conn:
         for i in range(count):
             answer = f"word{i}"
             cur = conn.execute("""INSERT INTO wrong_words
-                (answer, normalized_answer, error_count, first_error_at, last_error_at, review_due_date)
-                VALUES (?,?,?, '2026-09-01', '2026-09-14', ?)""", (answer, answer, i+1, due))
+                (answer, normalized_answer, error_count, first_error_at, last_error_at, review_due_date, review_pool,review_active)
+                VALUES (?,?,?, '2026-09-01', '2026-09-14', ?, 'maintenance',1)""", (answer, answer, i+1, due))
             conn.execute("""INSERT INTO word_examples(wrong_word_id,source_article,source_path,sentence)
                 VALUES (?, ?, ?, ?)""", (cur.lastrowid, f"a{i%4}.docx", f"a{i%4}.docx", f"Learn {answer} now."))
 
@@ -50,16 +52,23 @@ def word(repo):
 def test_intervals_and_restart(clock, tmp_path):
     repo = Repository(tmp_path / "db")
     seed(repo)
-    for expected_stage, interval in ((1,3), (2,7), (3,14), (4,30), (4,30)):
+    from src.services.fsrs7 import MemoryState, next_state
+    previous = None
+    last_day = None
+    for _ in range(5):
         session = daily(repo)
         assert session.total == 1
         submit(repo, session)
-        assert word(repo)["review_stage"] == expected_stage
-        assert word(repo)["review_due_date"] == (clock[0]+timedelta(days=interval)).isoformat()
+        expected = next_state(previous,3,(clock[0]-last_day).days if last_day else 0)
+        record = word(repo)
+        assert record['fsrs_stability'] == pytest.approx(expected.stability)
+        assert record['fsrs_stability_fast'] == pytest.approx(expected.stability_fast)
+        assert record['review_due_date'] > clock[0].isoformat()
         assert repo.today_review_ids() == []
         repo = Repository(repo.database_path)
-        assert word(repo)["review_stage"] == expected_stage
-        clock[0] += timedelta(days=interval)
+        assert word(repo)['fsrs_stability'] == record['fsrs_stability']
+        previous, last_day = expected, clock[0]
+        clock[0] = date.fromisoformat(record['review_due_date'])
     assert word(repo)["review_correct_count"] == 5
 
 
@@ -70,7 +79,7 @@ def test_failure_returns_tomorrow_regardless_of_viewing(clock, tmp_path, viewed)
         conn.execute("UPDATE wrong_words SET review_stage=3")
     session = daily(repo); session.viewed_answer = viewed
     submit(repo, session, correct=False)
-    assert word(repo)["review_stage"] == 3
+    assert word(repo)["review_stage"] == 0
     assert word(repo)["review_relearning"] == 1
     assert word(repo)["review_due_date"] == "2026-09-16"
     assert word(repo)["review_wrong_count"] == 1
@@ -83,7 +92,7 @@ def test_viewed_answer_does_not_penalize_correct_review(clock, tmp_path):
     session.viewed_answer = True  # Legacy draft flag must also be ignored.
     submit(repo, session)
     assert word(repo)["review_stage"] == 1
-    assert word(repo)["review_due_date"] == "2026-09-18"
+    assert word(repo)["review_due_date"] == "2026-09-19"
     assert word(repo)["review_correct_count"] == 1
     assert word(repo)["review_wrong_count"] == 0
     assert word(repo)["consecutive_correct"] == 1
@@ -119,9 +128,9 @@ def test_legacy_view_flag_uses_actual_mixed_results(clock, tmp_path, mode):
     for row in repo.list_wrong_words():
         correct = row["normalized_answer"] == correct_word
         assert row["consecutive_correct"] == int(correct)
-        assert row["review_stage"] == int(correct and mode in (PracticeMode.DAILY_REVIEW, PracticeMode.FULL_ARTICLE))
-        assert row["review_correct_count"] == int(correct and mode in (PracticeMode.DAILY_REVIEW, PracticeMode.FULL_ARTICLE))
-        assert row["review_wrong_count"] == int(not correct and mode == PracticeMode.DAILY_REVIEW)
+        assert row["review_stage"] == int(correct)
+        assert row["review_correct_count"] == int(correct)
+        assert row["review_wrong_count"] == int(not correct)
 
 
 def test_current_database_copy_and_legacy_view_flag(clock, tmp_path):
@@ -141,6 +150,7 @@ def test_current_database_copy_and_legacy_view_flag(clock, tmp_path):
         for table, rows in original.items():
             assert [tuple(r) for r in conn.execute(f'SELECT {columns[table]} FROM "{table}" ORDER BY rowid')] == rows
     assert repo.load_articles()[0]
+    repo.configure_review_budgets(40, 40)
     session = daily(repo)
     assert 0 < session.total <= 40
     session.viewed_answer = True
@@ -174,8 +184,8 @@ def test_unselected_overdue_words_keep_state_and_precede_new_due_words(clock, tm
         for index in range(20):
             answer = f"new-word{index}"
             cursor = conn.execute("""INSERT INTO wrong_words
-                (answer, normalized_answer, error_count, first_error_at, last_error_at, review_due_date)
-                VALUES (?,?,1000,'2026-09-01','2026-09-16',?)""",
+                (answer, normalized_answer, error_count, first_error_at, last_error_at, review_due_date, review_pool)
+                VALUES (?,?,1000,'2026-09-01','2026-09-16',?,'maintenance')""",
                 (answer, answer, clock[0].isoformat()))
             conn.execute("""INSERT INTO word_examples
                 (wrong_word_id,source_article,source_path,sentence) VALUES (?,?,?,?)""",
@@ -183,8 +193,8 @@ def test_unselected_overdue_words_keep_state_and_precede_new_due_words(clock, tm
         conn.execute("UPDATE wrong_words SET error_count=1000 WHERE id>70")
     next_ids = repo.today_review_ids()
     assert len(next_ids) == 40
-    assert len(set(next_ids[:28]) & unselected) == 28
-    assert all(word_id > 70 for word_id in next_ids[28:])
+    assert unselected.issubset(set(next_ids))
+    assert len(set(next_ids) - unselected) == 10
     with repo.connection() as conn:
         remaining = {row["id"]: tuple(row) for row in conn.execute(query, sorted(unselected))}
         for word_id in unselected - set(next_ids):
@@ -207,7 +217,7 @@ def test_retries_manual_success_and_stale_drafts_do_not_advance(clock, tmp_path)
         submit(repo, manual)
     assert word(repo)["review_stage"] == 1
     assert word(repo)["review_correct_count"] == 1
-    assert word(repo)["review_due_date"] == "2026-09-18"
+    assert word(repo)["review_due_date"] == "2026-09-19"
     clock[0] += timedelta(days=1)
     old = deepcopy(stale); old.session_key = "cross-day"; old.submitted = False
     submit(repo, old)
@@ -228,7 +238,7 @@ def test_ordinary_wrong_enters_tomorrow_and_relearning_shortens(clock, tmp_path)
     submit(repo, new_full_session(session.article))
     assert word(repo)["review_correct_count"] == before
     submit(repo, new_wrong_session(session), correct=False)
-    assert word(repo)["review_stage"] == 0
+    assert word(repo)["review_relearning"] == 1
     assert word(repo)["review_due_date"] == "2026-09-17"
 
 
@@ -277,6 +287,7 @@ def test_real_database_copy_preserves_every_existing_column(clock, tmp_path):
     assert articles and repo.list_wrong_words()
     assert repo.today_review_ids() == []
     clock[0] += timedelta(days=1)
+    repo.configure_review_budgets(40, 40)
     session = daily(repo)
     assert 0 < session.total <= 40
     submit(repo, session)
@@ -335,13 +346,13 @@ def test_failed_save_rolls_back_schedule_and_retry(clock, tmp_path):
     assert word(repo)["review_stage"] == 1
 
 
-def test_priority_uses_overdue_then_errors_then_recent_error(clock, tmp_path):
+def test_priority_reserves_recent_due_before_old_then_error_ties(clock, tmp_path):
     repo = Repository(tmp_path / "db"); seed(repo, 3)
     with repo.connection() as conn:
         conn.execute("UPDATE wrong_words SET error_count=5, last_error_at='2026-09-10'")
         conn.execute("UPDATE wrong_words SET last_error_at='2026-09-14' WHERE id=2")
         conn.execute("UPDATE wrong_words SET review_due_date='2026-09-01' WHERE id=3")
-    assert repo.today_review_ids() == [3,2,1]
+    assert repo.today_review_ids() == [2,1,3]
 
 
 def test_deletion_does_not_refill_daily_limit_or_lose_backlog(clock, tmp_path):
@@ -371,7 +382,8 @@ def test_next_day_ui_refresh_and_zero_message(clock, tmp_path, ui, monkeypatch):
     repo = Repository(tmp_path / "db"); seed(repo, 1, '2026-09-16')
     window = ui(repo)
     window.start_daily_review()
-    assert messages == ["今天没有需要复习的词。"]
+    assert len(messages) == 1 and messages[0].startswith("今天没有需要复习的词。")
+    assert "明天1词" in messages[0]
     clock[0] += timedelta(days=1)
     window._refresh_daily_review()
     assert window.actions["今日复习"].text() == "今日复习（1）"
@@ -405,12 +417,12 @@ def test_completed_ui_reports_backlog_without_refill(clock, tmp_path, ui, monkey
         edit.setText(window.session.article.item_map[item_id].answer)
     monkeypatch.setattr('src.ui.main_window.grade_session', lambda s: _grade_on(s, clock[0]))
     window._commit_submission()
-    assert "今日40词已完成" in window.progress_text.text()
-    assert "另有30词到期待安排" in window.progress_text.text()
-    assert "另有30词到期待安排" in window.actions["今日复习"].toolTip()
+    assert "今日已提交：40词\n待完成：0词" in window.progress_text.text()
+    assert "还有30词已到复习时间" in window.progress_text.text()
+    assert "另有30词已到复习时间" in window.actions["今日复习"].toolTip()
     window.start_daily_review()
-    assert "今日40词已完成" in messages[-1]
-    assert "另有30词到期待安排" in messages[-1]
+    assert "今日已提交40词，待完成0词" in messages[-1]
+    assert "另有30词已到复习时间" in messages[-1]
     assert repo.today_review_ids() == []
 
 

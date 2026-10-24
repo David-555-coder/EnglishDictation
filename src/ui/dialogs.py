@@ -1,13 +1,14 @@
 from __future__ import annotations
 import logging
 from datetime import date, timedelta
-from src.services.daily_review import memory_label, due_label
+from src.services.daily_review import due_label
+from src.ui.review_table import ReviewTable
 
 from PySide6.QtCore import QItemSelectionModel, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QHBoxLayout, QHeaderView, QLabel, QMenu, QMessageBox,
-                               QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QLineEdit)
+                               QPushButton, QTableWidgetItem, QVBoxLayout, QLineEdit)
 
 
 def recent_error_label(value: str, today: date) -> str:
@@ -36,6 +37,21 @@ def save_sort_preference(dialog) -> None:
     dialog.reload()
 
 
+def confirm_clear_wrong_words(repository, parent) -> bool:
+    if QMessageBox.warning(parent, "清空错词本",
+            "确定永久清空全部错词和例句吗？此操作不能撤销。\n\n"
+            "学习历史和原 Word 不会删除。建议先从“导出”保存学习备份。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        return False
+    try:
+        repository.clear_wrong_words()
+        return True
+    except Exception:
+        logging.exception("清空错词本失败")
+        QMessageBox.warning(parent, "清空失败", "错词本未能清空，请稍后重试。")
+        return False
+
+
 class WrongPracticeHistoryDialog(QDialog):
     practiceRequested = Signal(int)
 
@@ -44,11 +60,14 @@ class WrongPracticeHistoryDialog(QDialog):
         self.repository = repository
         self.wrong_only = wrong_only
         self.setWindowTitle("历史错词练习" if wrong_only else "全部学习历史")
-        self.resize(800, 520)
+        self.resize(720, 520)
         layout = QVBoxLayout(self)
-        title = QLabel("选择一次有错词的练习，双击或点击“开始练习”" if wrong_only else "最近 500 次提交记录；包括全部答对的练习")
+        title = QLabel("选择记录，双击或点击“开始练习”" if wrong_only else "最近 500 次提交记录")
+        title.setToolTip("选择一次有错词的练习，双击或点击“开始练习”" if wrong_only
+                         else "最近 500 次提交记录；包括全部答对的练习")
         title.setObjectName("dialogTitle")
         title.setWordWrap(True)
+        self.result_count = title
         title_row = QHBoxLayout()
         title_row.addWidget(title, 1)
         title_row.addWidget(QLabel("排序："))
@@ -59,8 +78,8 @@ class WrongPracticeHistoryDialog(QDialog):
         self.sort.currentIndexChanged.connect(lambda *_: save_sort_preference(self))
         title_row.addWidget(self.sort)
         layout.addLayout(title_row)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["完成时间", "文章", "类型", "总题数", "错题", "正确率"])
+        self.table = ReviewTable(6, parent=self)
+        self.table.set_review_headers(["完成时间", "文章", "类型", "总题数", "错题", "正确率"], {1})
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -73,7 +92,7 @@ class WrongPracticeHistoryDialog(QDialog):
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         # Keep short article names near their other fields instead of stretching
         # the article column across all remaining space. Columns remain resizable.
-        for column, width in ((1, 260), (2, 165), (3, 85), (4, 70), (5, 95)):
+        for column, width in ((1, 210), (2, 138), (3, 70), (4, 60), (5, 84)):
             header.setSectionResizeMode(column, QHeaderView.Interactive)
             self.table.setColumnWidth(column, width)
         header.setStretchLastSection(True)
@@ -85,13 +104,16 @@ class WrongPracticeHistoryDialog(QDialog):
         row = QHBoxLayout()
         self.delete_button = QPushButton("删除选中记录")
         self.delete_button.setObjectName("dangerButton")
+        self.delete_button.setAutoDefault(False)
         self.delete_button.clicked.connect(self._delete_selected)
         row.addWidget(self.delete_button)
         row.addStretch()
         self.start_button = QPushButton("开始练习")
         self.start_button.setObjectName("primaryButton")
+        self.start_button.setAutoDefault(False)
         self.start_button.clicked.connect(self._start)
         close = QPushButton("关闭")
+        close.setAutoDefault(False)
         close.clicked.connect(self.reject)
         row.addWidget(self.start_button)
         row.addWidget(close)
@@ -109,6 +131,9 @@ class WrongPracticeHistoryDialog(QDialog):
         if not self.wrong_only and order_by == "article":
             from src.utils.text_utils import natural_sort_key
             records.sort(key=lambda record: natural_sort_key(record["article_name"]))
+        self.result_count.setText((f'共 {len(records)} 条记录 · 双击或点击“开始练习”' if self.wrong_only
+                                   else f'最近 {len(records)} 条提交记录') if records else
+                                  ('暂无有错词的练习记录' if self.wrong_only else '暂无学习记录'))
         today = self.repository.today()
         self.table.setRowCount(len(records))
         for row, record in enumerate(records):
@@ -119,8 +144,7 @@ class WrongPracticeHistoryDialog(QDialog):
                 cell = QTableWidgetItem(value)
                 cell.setData(Qt.UserRole, record["id"])
                 cell.setToolTip(record["submitted_at"].replace("T", " ") if col == 0 else value)
-                if col >= 3:
-                    cell.setTextAlignment(Qt.AlignCenter)
+                cell.setTextAlignment(self.table.column_alignment(col))
                 self.table.setItem(row, col, cell)
         self._update_buttons()
 
@@ -174,7 +198,8 @@ class WrongPracticeHistoryDialog(QDialog):
             else:
                 self.table.setCurrentCell(index.row(), 0, QItemSelectionModel.NoUpdate)
         count = len(self._selected_rows())
-        menu = QMenu(self)
+        from src.ui.widgets.text_menus import style_menu
+        menu = style_menu(QMenu(self))
         start = menu.addAction("练习这次错词")
         start.setEnabled(count == 1)
         delete = menu.addAction(f"删除选中的 {count} 条记录" if count > 1 else "删除这条记录")
@@ -194,7 +219,7 @@ class WrongWordsDialog(QDialog):
         super().__init__(parent)
         self.repository = repository
         self.setWindowTitle("长期错词本")
-        self.resize(1100, 590)
+        self.resize(950, 590)
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
         top.addWidget(QLabel("排序："))
@@ -205,13 +230,18 @@ class WrongWordsDialog(QDialog):
         restore_sort_preference(self, "wrong_words_sort")
         self.sort.currentIndexChanged.connect(lambda *_: save_sort_preference(self))
         top.addWidget(self.sort)
-        self.search = QLineEdit(); self.search.setPlaceholderText("搜索英文或中文")
+        from src.ui.widgets.text_menus import TextLineEdit
+        self.search = TextLineEdit(); self.search.setPlaceholderText("搜索英文或中文")
+        self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._filter)
         top.addWidget(self.search)
         top.addStretch()
+        self.result_count = QLabel()
+        self.result_count.setObjectName('resultCount')
+        top.addWidget(self.result_count)
         layout.addLayout(top)
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["英文", "中文", "错误", "最近错误", "来源", "记忆状态", "复习安排"])
+        self.table = ReviewTable(7, wrapped_columns=(0, 1), parent=self)
+        self.table.set_review_headers(["英文", "中文", "错误", "最近错误", "来源", "记忆状态", "复习安排"], {0, 1, 4})
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -221,25 +251,28 @@ class WrongWordsDialog(QDialog):
         self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.verticalHeader().hide()
         header = self.table.horizontalHeader()
-        header.setMinimumSectionSize(75)
+        header.setMinimumSectionSize(45)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        for column, width in ((0, 260), (2, 85), (3, 115), (4, 150), (5, 105), (6, 130)):
+        for column, width in ((2, 54), (3, 84), (4, 110), (5, 102), (6, 112)):
             self.table.setColumnWidth(column, width)
         layout.addWidget(self.table)
         buttons = QHBoxLayout()
-        practice = QPushButton("练习选中错词"); practice.setObjectName("primaryButton")
-        practice.clicked.connect(self._practice_selected)
-        all_words = QPushButton("练习全部错词"); all_words.clicked.connect(self._practice_all)
-        buttons.addWidget(practice); buttons.addWidget(all_words)
-        delete = QPushButton("删除选中错词")
-        delete.clicked.connect(self._delete)
-        clear = QPushButton("清空错词本")
-        clear.setObjectName("dangerButton")
-        clear.clicked.connect(self._clear)
+        self.delete_button = QPushButton("删除选中错词")
+        self.delete_button.setObjectName("dangerButton")
+        self.delete_button.setAutoDefault(False)
+        self.delete_button.clicked.connect(self._delete)
+        self.start_button = QPushButton("开始练习")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.setAutoDefault(False)
+        self.start_button.clicked.connect(self._practice_selected)
         close = QPushButton("关闭")
+        close.setAutoDefault(False)
         close.clicked.connect(self.accept)
-        buttons.addWidget(delete); buttons.addWidget(clear); buttons.addStretch(); buttons.addWidget(close)
+        buttons.addWidget(self.delete_button); buttons.addStretch()
+        buttons.addWidget(self.start_button); buttons.addWidget(close)
         layout.addLayout(buttons)
+        self.table.itemSelectionChanged.connect(self._update_buttons)
         self.reload()
 
     def reload(self):
@@ -247,24 +280,32 @@ class WrongWordsDialog(QDialog):
         today = self.repository.today()
         today_iso = today.isoformat()
         planned = self.repository.pending_today_review_ids(today)
+        selections = self.repository.review_selection_details(today)
         self._search_texts = [(r["answer"] + r["chinese"]).casefold() for r in records]
         self.table.setUpdatesEnabled(False)
         try:
             self.table.setRowCount(len(records))
-            text_width = max(100, self.table.columnWidth(0) - 20)
-            metrics = self.table.fontMetrics()
             for row, record in enumerate(records):
                 values = [record["answer"], record["chinese"], record["error_count"],
                           recent_error_label(record["last_error_at"], today), record["sources"],
-                          memory_label(record["review_stage"], record["review_relearning"]),
-                          due_label(record["review_due_date"], today, record["id"] in planned)]
+                          ("等待重新学习" if not record["review_active"] else "需要巩固" if record["review_relearning"] or not record["fsrs_model"] else "按计划复习"),
+                          ("分批加入" if not record["review_active"] and record["id"] not in planned else
+                           due_label(record["review_due_date"], today, record["id"] in planned))]
                 for col, value in enumerate(values):
                     item = QTableWidgetItem(str(value))
                     tooltip = str(value) if col != 6 else (record["review_due_date"] or "待安排")
                     if col == 3:
                         tooltip = record["last_error_at"].replace("T", " ")
-                    if col == 5 and record["review_relearning"]:
-                        tooltip = "等待到期确认复习：答对后降一档恢复间隔，答错回到初学阶段。手动练习不改变确认状态。"
+                    if col == 5:
+                        tooltip = ("FSRS-7：已记录真实回忆；当日纠错单独记录，不等于长期掌握。"
+                                   if record["fsrs_model"] else "旧记录保留；等下一次真实回忆后逐步建立 FSRS-7 记忆状态。")
+                        if record["review_relearning"]:
+                            tooltip += "\n需要后续独立回忆确认。"
+                        if record["fsrs_due_at"]:
+                            tooltip += "\n模型建议时间：" + record["fsrs_due_at"]
+                        tooltip += ("\n等待分批重新学习；旧记忆记录和原安排仍然保留。"
+                                    if not record["review_active"] else
+                                    "\n已在持续复习中；近期错词不会因刚练过而被排到旧词后面。")
                     if col == 6 and record["review_due_date"] and record["review_due_date"] <= today_iso:
                         due = date.fromisoformat(record["review_due_date"])
                         tooltip = f"原定复习：{due.isoformat()}"
@@ -273,10 +314,15 @@ class WrongWordsDialog(QDialog):
                         tooltip += ("\n已列入今日任务。" if record["id"] in planned
                                     else "\n仍在队列中，等待后续安排；原定日期不变。")
                     item.setToolTip(tooltip)
+                    if col == 6 and record['id'] in selections:
+                        selected = selections[record['id']]
+                        if selected['policy_version']:
+                            why = '按原计划返回' if selected['selection_reason'] == 'scheduled_return' else '分批加入旧词'
+                            item.setToolTip(tooltip + f"\n本次原因：{why}\n选入时间：{selected['selected_at']}\n排队规则：{selected['policy_version']}")
                     item.setData(Qt.UserRole, record["id"])
+                    item.setTextAlignment(self.table.column_alignment(col))
                     self.table.setItem(row, col, item)
-                lines = min(3, max(1, (metrics.horizontalAdvance(record["answer"]) + text_width - 1) // text_width))
-                self.table.setRowHeight(row, 34 + (lines - 1) * 20)
+            self.table.refresh_row_heights()
             self._filter()
         finally:
             self.table.setUpdatesEnabled(True)
@@ -284,27 +330,40 @@ class WrongWordsDialog(QDialog):
     def _filter(self, *_):
         if not hasattr(self, "table"): return
         query = self.search.text().casefold().strip()
+        visible = 0
         for row, text in enumerate(getattr(self, "_search_texts", [])):
             hidden = query not in text
+            visible += not hidden
             if self.table.isRowHidden(row) != hidden:
                 self.table.setRowHidden(row, hidden)
+        total = self.table.rowCount()
+        self.result_count.setText('暂无错词' if not total else '没有匹配的词' if not visible
+                                  else f'找到 {visible} / {total} 词' if query else f'共 {total} 词')
+        self._update_buttons()
+
+    def _selected_rows(self):
+        return sorted(index.row() for index in self.table.selectionModel().selectedRows(0)
+                      if not self.table.isRowHidden(index.row()))
+
+    def _update_buttons(self):
+        count = len(self._selected_rows())
+        self.start_button.setEnabled(count > 0)
+        self.delete_button.setEnabled(count > 0)
+        self.start_button.setText(f"开始练习（{count}词）" if count else "开始练习")
+        self.delete_button.setText(f"删除选中的 {count} 个错词" if count > 1 else "删除选中错词")
 
     def _practice_selected(self):
-        rows = sorted({index.row() for index in self.table.selectedIndexes() if not self.table.isRowHidden(index.row())})
+        rows = self._selected_rows()
         if not rows:
             QMessageBox.information(self, "请选择错词", "选中要练习的词，可按 Ctrl 或 Shift 多选。"); return
         self.practiceRequested.emit([self.table.item(row, 0).data(Qt.UserRole) for row in rows]); self.accept()
-
-    def _practice_all(self):
-        ids = [self.table.item(row, 0).data(Qt.UserRole) for row in range(self.table.rowCount())]
-        if ids: self.practiceRequested.emit(ids); self.accept()
 
     def _selected_id(self):
         row = self.table.currentRow()
         return self.table.item(row, 0).data(Qt.UserRole) if row >= 0 and self.table.item(row, 0) else None
 
     def _delete(self):
-        rows = sorted({i.row() for i in self.table.selectedIndexes() if not self.table.isRowHidden(i.row())})
+        rows = self._selected_rows()
         if not rows: return
         if QMessageBox.question(self, "删除错词", f"确定删除选中的 {len(rows)} 个错词及例句吗？学习历史不会删除。",
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
@@ -313,11 +372,3 @@ class WrongWordsDialog(QDialog):
             self.reload()
         except Exception:
             logging.exception("删除错词失败"); QMessageBox.warning(self, "删除失败", "部分错词可能未删除，请刷新后重试。")
-
-    def _clear(self):
-        if QMessageBox.warning(self, "清空错词本", "确定永久清空全部错词和例句吗？此操作不能撤销。",
-                               QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
-            try:
-                self.repository.clear_wrong_words(); self.reload()
-            except Exception:
-                logging.exception("清空错词本失败"); QMessageBox.warning(self, "清空失败", "错词本未能清空，请稍后重试。")

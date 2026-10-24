@@ -68,17 +68,22 @@ def test_last_enter_confirms_once_default_check_then_submits(tmp_path, ui, monke
     assert len(seen) == 2 and len(window.repository.list_history()) == 1
 
 
-def test_collapsed_sidebar_keeps_draft_and_restores_setting(tmp_path, ui):
+def test_collapsed_sidebar_keeps_draft_and_restores_setting(tmp_path, ui, monkeypatch):
     window = practice(tmp_path, ui)
     edit = next(iter(window.answer_edits.values())); edit.setText("unfinished")
     before = window.scroll.width()
-    window.library_toggle.click(); QApplication.processEvents()
+    window.actions['显示文章列表'].trigger(); QApplication.processEvents()
     assert window.library_collapsed and window.article_panel.isHidden()
     assert window.scroll.width() > before
     assert next(iter(window.answer_edits.values())) is edit
     window.close()
     reopened = ui(Repository(tmp_path / "db")); reopened._restore_article_library()
     assert reopened.library_collapsed and reopened.article_panel.isHidden()
+    assert reopened.session is None
+    from src.ui.unfinished_dialog import UnfinishedPracticeDialog
+    from PySide6.QtWidgets import QDialog
+    monkeypatch.setattr(UnfinishedPracticeDialog, 'exec', lambda dialog: QDialog.Accepted)
+    reopened.resume_draft()
     assert next(iter(reopened.answer_edits.values())).text() == "unfinished"
-    reopened.library_toggle.click()
+    reopened.actions['显示文章列表'].trigger()
     assert not reopened.library_collapsed and not reopened.article_panel.isHidden()

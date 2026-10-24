@@ -36,6 +36,10 @@ def configure_logging(root: Path) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--verify-release":
+        # Isolated packaged-app QA: this branch never opens normal learning data.
+        from src.services.release_check import run
+        return run(Path(sys.argv[2]).resolve())
     root = resolve_storage_root()
     configure_logging(root)
     try:

@@ -1,30 +1,34 @@
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QLineEdit
+from src.ui.widgets.text_menus import TextLineEdit
+from math import ceil
 
 
-class AnswerLineEdit(QLineEdit):
+class AnswerLineEdit(TextLineEdit):
     requestMove = Signal(int)
     focusEntered = Signal(str)
 
     def __init__(self, item_id: str, answer_length: int, parent=None):
         super().__init__(parent)
         self.item_id = item_id
-        self.setMinimumWidth(85)
-        self.setMaximumWidth(650)
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(320)
         self.setPlaceholderText("")
         self.setAccessibleName("默写答案")
         self.setProperty("answerLength", answer_length)
+        self.setProperty("flowInput", True)
 
     def update_preferred_width(self):
         """Measure on render, zoom or focus, not on each input character."""
         self.ensurePolished()
         metrics = self.fontMetrics()
         expected = self.property("answerText") or ("n" * (self.property("answerLength") or 8))
-        padding = metrics.horizontalAdvance("mm") + 24
-        minimum = max(100, round(100 * metrics.height() / 24))
-        width = min(650, max(minimum, metrics.horizontalAdvance(expected) + padding,
-                             metrics.horizontalAdvance(self.text()) + padding))
+        scale = self.property("flowScale") or max(.7, metrics.height() / 26)
+        words = len(expected.split())
+        low, high = (120, 170) if words <= 1 else (180, 250) if words <= 3 else (220, 320)
+        measured = max(metrics.horizontalAdvance(expected), metrics.horizontalAdvance(self.text())) / scale + 24
+        width = round(min(high, max(low, ceil(measured / 10) * 10)) * scale)
+        self.setMaximumWidth(round(high * scale))
         if self.property("preferredFlowWidth") == width:
             return False
         self.setProperty("preferredFlowWidth", width)

@@ -46,9 +46,9 @@ def main():
     for index, edit in enumerate(window.answer_edits.values()):
         if index < 3: edit.setText("my answer")
     window.grab().save(str(root / "02-practice.png"))
-    window.library_toggle.click(); QTest.qWait(80)
+    window.actions['显示文章列表'].trigger(); QTest.qWait(80)
     window.grab().save(str(root / "02-collapsed.png"))
-    window.library_toggle.click(); QTest.qWait(80)
+    window.actions['显示文章列表'].trigger(); QTest.qWait(80)
     window.set_zoom(150); QTest.qWait(100)
     window.grab().save(str(root / "03-zoom.png"))
     window.set_zoom(100); window.submit(); QTest.qWait(100)
